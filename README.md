@@ -4,6 +4,7 @@
     </a>
     <h2>🐖 nonebot-plugin-rollpig 🐖</h2>
     今天是什么小猪 🐽
+    本项目基于 Bearlele/nonebot-plugin-rollpig 修改，增添部分新功能
 </div>
 
 ### 🐖 食用方法 🐖
@@ -34,7 +35,18 @@ nb plugin install nonebot_plugin_rollpig
 
 **随机小猪** - 从PigHub随机获取一张猪猪图 🐖
 
+**明日小猪** - 预测明天的猪猪运势
+
+**昨日小猪** - 查看昨天抽到了什么
+
+**今日烤猪** - 把今天的猪做成美食（慎用！）
+
+**我的猪圈** - 查看解锁进度
+
+**本周小猪** - 生成本周猪猪总结长图
+
 ---
+
 
 ### 🐖 新增小猪 🐖
 
