@@ -10,6 +10,8 @@ from nonebot import on_command, require, get_bot
 from nonebot.adapters.onebot.v11 import Event, MessageSegment, Message, GroupMessageEvent
 from nonebot.log import logger
 from nonebot.plugin import PluginMetadata
+from .config import Config  
+from .roast_manager import roast_manager 
 
 # 确保依赖插件先被 NoneBot 注册
 require("nonebot_plugin_htmlrender")
@@ -100,6 +102,7 @@ __plugin_meta__ = PluginMetadata(
     type="application",
     homepage="https://github.com/Felis2026/nonebot-plugin-rollpig",
     supported_adapters={"~onebot.v11"},
+    config=Config,
 )
 
 # 插件目录
@@ -310,18 +313,19 @@ async def _(event: Event):
     user_id = str(event.user_id)
     original_pig = data_manager.get_today_pig(user_id)
     
+    # 1. 检查是否抽过
     if not original_pig:
         await cmd_roast.finish(MessageSegment.reply(event.message_id) + "你连猪都不是，怎么烤？先发送「今日小猪」抽取身份吧。")
         return
     
-    # 🔴 新增逻辑：检查是不是已经是食材了
+    # 2. 检查是否已经是食材 (禁止套娃)
     if original_pig["id"] in FOOD_PIG_IDS:
         msg = MessageSegment.reply(event.message_id) + \
               f"住手！你已经是【{original_pig['name']}】了！再烤就变成焦炭了... (拒绝二次加工)"
         await cmd_roast.finish(msg)
         return
     
-    # 随机选一个美食形态
+    # 3. 随机选一个美食形态
     food_id = random.choice(FOOD_PIG_IDS)
     food_pig_template = get_pig_by_id(food_id)
     
@@ -329,12 +333,15 @@ async def _(event: Event):
         await cmd_roast.finish("烤炉坏了（找不到美食猪数据）。")
         return
 
-    # 动态修改文案，生成临时的“烤熟”数据
+    # --- 核心修改：使用 Manager 获取文案 ---
+    # 提示：如果是 AI 生成，可能需要 1-2 秒，可以发个提示（可选）
+    # await cmd_roast.send("🔥 正在生火...") 
+    
+    roast_text = await roast_manager.get_roast_text(original_pig, food_pig_template)
+
+    # 4. 生成临时的“烤熟”数据用于渲染
     roasted_pig_data = food_pig_template.copy()
-    roasted_pig_data["analysis"] = (
-        f"你本来是一只快乐的【{original_pig['name']}】，"
-        f"直到被送上了烤架... {roasted_pig_data['analysis']}"
-    )
+    roasted_pig_data["analysis"] = roast_text # 直接覆盖 analysis
     
     await send_rendered_pig(cmd_roast, event, roasted_pig_data)
 

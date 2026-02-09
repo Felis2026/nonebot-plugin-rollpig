@@ -4,4 +4,5 @@ nonebot-plugin-htmlrender
 nonebot-plugin-localstore
 httpx
 Pillow
+openai
 #nonebot-plugin-apscheduler #按需

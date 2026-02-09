@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "nonebot_plugin_rollpig"
-version = "0.2.7"  # 更新新功能
+version = "0.2.8"  # 更新AI烤猪
 description = "今天是什么小猪"
 authors = ["Bear_lele <lele2587342146@gmail.com>","Felis"]
 license = "MIT"
@@ -22,6 +22,9 @@ Pillow = ">=9.0.0"
 
 # 👇 [修改] 删除：暂时移除
 # nonebot-plugin-apscheduler = ">=0.5.0"
+
+# 👇 【新增】AI 烤猪核心依赖
+openai = ">=1.0.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
