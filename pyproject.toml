@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "nonebot_plugin_rollpig"
-version = "0.2.8"  # 更新AI烤猪
+version = "0.2.9"  # 更新AI烤猪
 description = "今天是什么小猪"
 authors = ["Bear_lele <lele2587342146@gmail.com>","Felis"]
 license = "MIT"
