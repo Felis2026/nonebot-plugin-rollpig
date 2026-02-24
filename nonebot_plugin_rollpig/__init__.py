@@ -6,7 +6,7 @@ import httpx
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from nonebot import on_command, require, get_bot
+from nonebot import on_command, require, get_bot, get_driver, get_plugin_config
 from nonebot.adapters.onebot.v11 import Event, MessageSegment, Message, GroupMessageEvent, Bot
 from nonebot.params import CommandArg
 from nonebot.log import logger
@@ -76,6 +76,8 @@ TOMORROW_TEXTS = [
 
 FOOD_PIG_IDS = ["roasted-pig", "bacon", "mc_porkchop", "pork-skewer"]
 HUMAN_PIG_ID = "human"
+FORCE_ROAST_KEYWORDS = {"打点后厨", "偷换烤架", "贿赂主厨", "加急生火", "加急生活"}
+SUPER_FORCE_ROAST_KEYWORD = "强行点火"
 
 # 烧烤拦截/失败文案池（尽量保持项目原有的玩梗风格）
 TODAY_ROAST_HUMAN_BLOCK_TEXTS = [
@@ -118,6 +120,59 @@ BACKFIRE_GENERIC_TEXTS = [
     "【{attacker}】一叉子扎空，脚底一滑栽进火坑，现场香味却来自自己。",
 ]
 
+ESCAPE_TEXTS = [
+    "【{attacker}】刚举起烤叉，【{target}】（{shape}）一个滑铲钻进人群，瞬间消失。",
+    "【{attacker}】火都点好了，结果【{target}】（{shape}）反手就是蛇皮走位，烤架当场空军。",
+    "【{target}】（{shape}）闻到孜然味拔腿就跑，留下【{attacker}】在风中举叉沉默。",
+    "【{attacker}】瞄准半天正要下手，【{target}】（{shape}）一个假动作直接逃出生天。",
+    "【{target}】（{shape}）临场开了疾跑，【{attacker}】追了三条街只捡回一撮胡椒粉。",
+    "【{attacker}】端着烤盘冲锋，结果【{target}】（{shape}）踩着锅沿完成极限撤离。",
+    "火候拉满，气氛到位，偏偏【{target}】（{shape}）先一步跑路，气得【{attacker}】把炭都捏碎了。",
+    "【{attacker}】本想来场现场烧烤秀，没想到主角【{target}】（{shape}）直接退场。",
+]
+
+SUPER_FORCE_ROAST_PREFIX_TEXTS = [
+    "老板好！主厨一看是您来了，吓得赶紧一脚踹翻了【{target}】的旧烤架，换上了全新的无冷却核动力烤炉！",
+    "最高权限已介入。后厨为您强行拉闸断电，【{target}】的烧烤计时器被你一把捏碎了。",
+    "你一言不发地走进后厨，所有帮厨立刻起立敬礼。你指了指【{target}】的炉子，火瞬间就重燃了。",
+    "城管？在这里你就是城管！【{target}】的烤架已强行预热完毕，请老板随时下嘴！",
+]
+
+FORCE_ROAST_PREFIX_TEXTS = [
+    "你趁着夜色往主厨的围裙里塞了一把碎银子。主厨心领神会，偷偷往【{target}】的炉子里泼了盆冷水。（今日打点次数已用尽）",
+    "你在黑市花高价买了一块千年寒冰，成功给【{target}】的烤架物理降温。准备好再次开火了吗？（黑市通行证今日已作废）",
+    "你和负责烧烤的赛博义体大爷对上了暗号，大爷悄悄拨回了【{target}】的倒计时器。（今日后厨暗门已对你关闭）",
+    "你牺牲了一包辣条，成功贿赂了看守烤架的保安。【{target}】的开火权已重置！（今天别再来了，容易被抓）",
+]
+
+FORCE_ROAST_LIMIT_TEXTS = [
+    "你今天已经在后厨晃悠过一次了！主厨举着带血的菜刀把你赶了出去：‘再搞事连你一起烤！’",
+    "黑市大门紧闭，门上贴着条子：【{operator}】今日交易额度已超标，已被列入后厨失信名单。",
+    "你刚掏出钱，就被暗中埋伏的群管当场按倒！偷换烤架失败，快跑吧！",
+    "你还来？【{target}】的烤架都快被你盘包浆了，回去等明天的黑市开门吧！",
+]
+
+plugin_config = get_plugin_config(Config)
+
+
+def resolve_roast_cooldown_seconds() -> int:
+    """解析普通烤群友 CD（秒），支持通过配置覆盖。"""
+    raw_hours = getattr(plugin_config, "rollpig_roast_cooldown_hours", 8.0)
+    try:
+        hours = float(raw_hours)
+    except (TypeError, ValueError):
+        logger.warning(f"rollpig_roast_cooldown_hours 配置非法: {raw_hours}，已回退到 8 小时")
+        hours = 8.0
+
+    if hours <= 0:
+        logger.warning(f"rollpig_roast_cooldown_hours 必须 > 0，当前值: {hours}，已回退到 8 小时")
+        hours = 8.0
+
+    return max(1, int(hours * 3600))
+
+
+ROAST_COOLDOWN_SECONDS = resolve_roast_cooldown_seconds()
+
 # ========================================================
 
 __plugin_meta__ = PluginMetadata(
@@ -134,6 +189,8 @@ __plugin_meta__ = PluginMetadata(
     昨日小猪 - 查看昨天抽到了什么
     今日烤猪 - 把今天的猪做成美食（人类/熟食形态会拦截）
     烤群友 - 把群友做成烤猪（目标需已抽猪且非人类/熟食）
+    烤群友 + 打点后厨/偷换烤架/贿赂主厨/加急生火(兼容加急生活) - 每日一次强制成功（目标仍需已抽猪且非人类/熟食）
+    烤群友 + 强行点火 - superuser 专属，无限强制成功（目标仍需已抽猪且非人类/熟食）
     
     📊 统计指令：
     我的猪圈 - 查看解锁进度
@@ -162,20 +219,21 @@ class PigDataManager:
         # {
         #   "history": {"YYYY-MM-DD": {"user_id": pig_obj}},
         #   "collection": {"user_id": [pig_id, ...]},
-        #   "usage": {"user_id": last_roast_timestamp}
+        #   "usage": {"user_id": last_roast_timestamp},
+        #   "force_usage": {"user_id": "YYYY-MM-DD"}
         # }
         self.data = self._load()
 
     def _load(self):
         if not self.file.exists():
-            default_data = {"history": {}, "collection": {}, "usage": {}}
+            default_data = {"history": {}, "collection": {}, "usage": {}, "force_usage": {}}
             self.file.write_text(json.dumps(default_data, ensure_ascii=False, indent=2), encoding="utf-8")
             return default_data
         try:
             return json.loads(self.file.read_text("utf-8"))
         except Exception as e:
             logger.warning(f"pig_data.json 读取失败，已使用空数据兜底: {e}")
-            return {"history": {}, "collection": {}, "usage": {}}
+            return {"history": {}, "collection": {}, "usage": {}, "force_usage": {}}
 
     def save(self):
         self.file.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -204,7 +262,7 @@ class PigDataManager:
 
     def check_roast_usage(self, user_id: str) -> tuple[bool, str]:
         """
-        检查是否可用 (8小时CD)
+        检查是否可用（普通模式 CD）
         返回: (是否可用, 提示信息)
         """
         import time
@@ -220,7 +278,7 @@ class PigDataManager:
 
         last_use = self.data["usage"].get(user_id, 0)
         now = time.time()
-        cooldown = 8 * 3600  # 8小时 = 28800秒
+        cooldown = ROAST_COOLDOWN_SECONDS
         
         if now - last_use < cooldown:
             # 计算剩余时间
@@ -244,6 +302,20 @@ class PigDataManager:
             self.data["usage"] = {}
             
         self.data["usage"][user_id] = time.time()
+        self.save()
+
+    def check_force_roast_usage(self, user_id: str) -> bool:
+        """普通用户后门：每日仅 1 次"""
+        today = datetime.date.today().isoformat()
+        if "force_usage" not in self.data or not isinstance(self.data["force_usage"], dict):
+            self.data["force_usage"] = {}
+        return self.data["force_usage"].get(user_id) != today
+
+    def update_force_roast_usage(self, user_id: str):
+        today = datetime.date.today().isoformat()
+        if "force_usage" not in self.data or not isinstance(self.data["force_usage"], dict):
+            self.data["force_usage"] = {}
+        self.data["force_usage"][user_id] = today
         self.save()
 
     def clean_old_history(self, days_to_keep=14):
@@ -309,6 +381,40 @@ def pick_backfire_text(attacker_name: str, target_name: str, attacker_pig: Optio
         shape = attacker_pig.get("name", "未知形态")
 
     return random.choice(pool).format(attacker=attacker_name, target=target_name, shape=shape)
+
+
+def pick_escape_text(attacker_name: str, target_name: str, target_pig: Optional[dict]) -> str:
+    shape = target_pig.get("name", "未知形态") if target_pig else "未知形态"
+    return random.choice(ESCAPE_TEXTS).format(attacker=attacker_name, target=target_name, shape=shape)
+
+
+def is_superuser_user(user_id: str) -> bool:
+    superusers = {str(x) for x in getattr(get_driver().config, "superusers", set())}
+    if user_id in superusers:
+        return True
+    # 兼容 "adapter:user_id" 形式
+    return any(s.endswith(f":{user_id}") for s in superusers)
+
+
+def detect_force_roast_mode(raw_text: str, user_id: str) -> Optional[str]:
+    normalized = raw_text.replace("/", "").replace(" ", "").replace("　", "")
+    has_super_cmd = SUPER_FORCE_ROAST_KEYWORD in normalized
+    has_force_cmd = any(k in normalized for k in FORCE_ROAST_KEYWORDS)
+
+    if has_super_cmd:
+        return "super" if is_superuser_user(user_id) else "super_denied"
+    if has_force_cmd:
+        return "normal"
+    return None
+
+
+def pick_force_prefix_text(target_name: str, is_super_mode: bool) -> str:
+    pool = SUPER_FORCE_ROAST_PREFIX_TEXTS if is_super_mode else FORCE_ROAST_PREFIX_TEXTS
+    return random.choice(pool).format(target=target_name)
+
+
+def pick_force_limit_text(operator_name: str, target_name: str) -> str:
+    return random.choice(FORCE_ROAST_LIMIT_TEXTS).format(operator=operator_name, target=target_name)
 
 
 async def ensure_pighub_images_loaded() -> bool:
@@ -543,12 +649,13 @@ cmd_roast_member = on_command("烤群友", block=True)
 @cmd_roast_member.handle()
 async def _(bot: Bot, event: GroupMessageEvent): # 确保用 GroupMessageEvent 方便获取群名片
     attacker_id = str(event.user_id)
-    
-    # 1. 检查 8 小时冷却状态
-    is_available, tip_msg = data_manager.check_roast_usage(attacker_id)
-    if not is_available:
-        # 发送冷却提示
-        await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + tip_msg)
+    attacker_name = event.sender.card or event.sender.nickname
+    force_mode = detect_force_roast_mode(event.get_plaintext(), attacker_id)  # None / normal / super / super_denied
+
+    if force_mode == "super_denied":
+        await cmd_roast_member.finish(
+            MessageSegment.reply(event.message_id) + "口令【强行点火】仅 superuser 可用。"
+        )
         return
 
     # 2. 提取目标 ID 和 名字
@@ -587,7 +694,7 @@ async def _(bot: Bot, event: GroupMessageEvent): # 确保用 GroupMessageEvent �
         await cmd_roast_member.finish("对自己好一点，别自焚。请发送「今日烤猪」。")
         return
 
-    # 3. 检查目标是否可被烧烤（已抽取、非人类、非熟食）
+    # 3. 读取目标形态：后门模式也不绕过“未抽猪/人类/熟食”限制
     target_pig = data_manager.get_today_pig(target_id)
     if not target_pig:
         await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + f"【{target_name}】今天还没抽猪，没法下嘴！")
@@ -599,7 +706,7 @@ async def _(bot: Bot, event: GroupMessageEvent): # 确保用 GroupMessageEvent �
             + random.choice(TARGET_HUMAN_BLOCK_TEXTS).format(target=target_name)
         )
         return
-    
+
     if is_food_pig(target_pig):
         await cmd_roast_member.finish(
             MessageSegment.reply(event.message_id)
@@ -609,12 +716,44 @@ async def _(bot: Bot, event: GroupMessageEvent): # 确保用 GroupMessageEvent �
         )
         return
 
-    # 4. 消耗次数
-    data_manager.update_roast_usage(attacker_id)
+    # 4. 模式化限制/计数
+    if force_mode == "normal":
+        if not data_manager.check_force_roast_usage(attacker_id):
+            reject_text = pick_force_limit_text(attacker_name, target_name)
+            await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + reject_text)
+            return
+        data_manager.update_force_roast_usage(attacker_id)
+    elif force_mode is None:
+        is_available, tip_msg = data_manager.check_roast_usage(attacker_id)
+        if not is_available:
+            await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + tip_msg)
+            return
+        data_manager.update_roast_usage(attacker_id)
+    # super 模式无限制，不消耗普通后门计数，也不走 8h CD
 
-    # 5. 概率判定
+    # 5. 后门模式：必定成功
+    if force_mode in {"normal", "super"}:
+        food_id = random.choice(FOOD_PIG_IDS)
+        food_pig_template = get_pig_by_id(food_id)
+        if not food_pig_template:
+            await cmd_roast_member.finish("食材配置缺失，请联系管理员修复 pig.json。")
+            return
+
+        text = await roast_manager.get_roast_text(
+            target_pig,
+            food_pig_template,
+            operator_name=attacker_name,
+            target_name=target_name
+        )
+        prefix_text = pick_force_prefix_text(target_name, is_super_mode=(force_mode == "super"))
+
+        roasted_data = food_pig_template.copy()
+        roasted_data["analysis"] = text
+        await send_rendered_pig(cmd_roast_member, event, roasted_data, extra_text=prefix_text)
+        return
+
+    # 6. 普通模式概率判定
     roll = random.randint(1, 100)
-    attacker_name = event.sender.card or event.sender.nickname
 
     # === 场景 A: 成功 (60%) ===
     if roll <= 60:
@@ -639,7 +778,7 @@ async def _(bot: Bot, event: GroupMessageEvent): # 确保用 GroupMessageEvent �
         
     # === 场景 B: 逃脱 (30%) ===
     elif roll <= 90:
-        escape_text = f"【{attacker_name}】拿着烤叉冲了过来，但【{target_name}】（{target_pig['name']}）身手敏捷，一个滑铲逃之夭夭！"
+        escape_text = pick_escape_text(attacker_name, target_name, target_pig)
         await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + escape_text)
         
     # === 场景 C: 反噬 (10%) ===
@@ -781,6 +920,7 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
         return
 
     msg = MessageSegment.reply(event.message_id)
-    if extra_text: msg += extra_text
+    if extra_text:
+        msg += extra_text + "\n"
     msg += MessageSegment.image(pic)
     await matcher.finish(msg)
