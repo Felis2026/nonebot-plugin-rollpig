@@ -74,7 +74,7 @@ TOMORROW_TEXTS = [
     "明天的你正在发送好友申请，是否通过？✅"
 ]
 
-FOOD_PIG_IDS = ["roasted-pig", "bacon", "mc_porkchop", "pork-skewer"]
+FOOD_PIG_IDS = ["roasted-pig", "bacon", "mc_porkchop", "pork-skewer", "char-siu", "pork-floss"]
 HUMAN_PIG_ID = "human"
 FORCE_ROAST_KEYWORDS = {"打点后厨", "偷换烤架", "贿赂主厨", "加急生火", "加急生活"}
 SUPER_FORCE_ROAST_KEYWORD = "强行点火"
