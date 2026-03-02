@@ -12,14 +12,14 @@
 使用 pip 安装：
 
 ```bash
-pip install nonebot_plugin_rollpig
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@felis-dev"
 
 ```
 
-或者使用 nb-cli 安装：
+或者使用 pip fixed-tag 安装：
 
 ```bash
-nb plugin install nonebot_plugin_rollpig
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.3.1"
 
 ```
 
