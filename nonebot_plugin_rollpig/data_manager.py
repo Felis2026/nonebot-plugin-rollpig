@@ -200,6 +200,157 @@ class PigDataManager:
             self.data.setdefault("force_usage", {})[user_id] = today
             await self._atomic_save()
 
+    # ---- 烤群友事件记录（用于每日总结） ----
+
+    async def log_roast_event(self, event_type: str, attacker_id: str, target_id: str,
+                               attacker_name: str = "", target_name: str = "",
+                               food: str = "", group_id: str = ""):
+        """
+        记录一次烤群友事件。
+        event_type: "success" / "escape" / "backfire" / "bot_backfire"
+        """
+        async with self._lock:
+            today = datetime.date.today().isoformat()
+            events = self.data.setdefault("daily_events", {})
+            day_events = events.setdefault(today, [])
+            day_events.append({
+                "type": event_type,
+                "attacker": attacker_id,
+                "target": target_id,
+                "attacker_name": attacker_name,
+                "target_name": target_name,
+                "food": food,
+                "group_id": group_id,
+            })
+            await self._atomic_save()
+
+    def get_daily_events(self, date_str: Optional[str] = None) -> list:
+        """获取指定日期（默认今天）的所有烤群友事件。"""
+        if not date_str:
+            date_str = datetime.date.today().isoformat()
+        return self.data.get("daily_events", {}).get(date_str, [])
+
+    def get_daily_summary(self, date_str: Optional[str] = None) -> dict:
+        """
+        汇总指定日期的烤群友数据，返回:
+        {
+            "total": int,
+            "most_roasted_id": str | None,      # 被烤最多的 UID
+            "most_roasted_name": str,
+            "most_roasted_count": int,
+            "most_active_id": str | None,        # 烤人最多的 UID
+            "most_active_name": str,
+            "most_active_count": int,
+            "escape_king_id": str | None,        # 逃脱最多的 UID
+            "escape_king_name": str,
+            "escape_king_count": int,
+            "backfire_king_id": str | None,      # 反噬最多的 UID
+            "backfire_king_name": str,
+            "backfire_king_count": int,
+        }
+        """
+        events = self.get_daily_events(date_str)
+        if not events:
+            return {"total": 0}
+
+        from collections import Counter
+        roasted_counter: Counter = Counter()       # 被烤次数
+        attacker_counter: Counter = Counter()      # 发起烤次数
+        escape_counter: Counter = Counter()        # 逃脱次数
+        backfire_counter: Counter = Counter()      # 反噬次数
+        name_map: dict = {}
+
+        for e in events:
+            a_id = e.get("attacker", "")
+            t_id = e.get("target", "")
+            if e.get("attacker_name"):
+                name_map[a_id] = e["attacker_name"]
+            if e.get("target_name"):
+                name_map[t_id] = e["target_name"]
+
+            etype = e.get("type", "")
+            if etype == "success":
+                roasted_counter[t_id] += 1
+                attacker_counter[a_id] += 1
+            elif etype == "escape":
+                escape_counter[t_id] += 1
+                attacker_counter[a_id] += 1
+            elif etype in ("backfire", "bot_backfire"):
+                backfire_counter[a_id] += 1
+                attacker_counter[a_id] += 1
+
+        def _top(counter: Counter):
+            if not counter:
+                return None, "", 0
+            uid, count = counter.most_common(1)[0]
+            return uid, name_map.get(uid, uid), count
+
+        mr_id, mr_name, mr_count = _top(roasted_counter)
+        ma_id, ma_name, ma_count = _top(attacker_counter)
+        ek_id, ek_name, ek_count = _top(escape_counter)
+        bk_id, bk_name, bk_count = _top(backfire_counter)
+
+        return {
+            "total": len(events),
+            "most_roasted_id": mr_id, "most_roasted_name": mr_name, "most_roasted_count": mr_count,
+            "most_active_id": ma_id, "most_active_name": ma_name, "most_active_count": ma_count,
+            "escape_king_id": ek_id, "escape_king_name": ek_name, "escape_king_count": ek_count,
+            "backfire_king_id": bk_id, "backfire_king_name": bk_name, "backfire_king_count": bk_count,
+            **self._get_roll_stats(date_str),
+        }
+
+    def _get_roll_stats(self, date_str: Optional[str] = None) -> dict:
+        """从 history 中统计今日抽猪信息。"""
+        from collections import Counter
+        if not date_str:
+            date_str = datetime.date.today().isoformat()
+        today_rolls = self.data.get("history", {}).get(date_str, {})
+        if not today_rolls:
+            return {"roll_count": 0}
+
+        pig_counter: Counter = Counter(today_rolls.values())
+        top_pig_id, top_pig_count = pig_counter.most_common(1)[0]
+
+        # 统计人类形态的用户
+        human_ids = [uid for uid, pid in today_rolls.items() if pid == "human"]
+
+        return {
+            "roll_count": len(today_rolls),
+            "top_pig_id": top_pig_id,
+            "top_pig_count": top_pig_count,
+            "human_count": len(human_ids),
+        }
+
+    # ---- 被烤最多 → 次日保护 ----
+
+    def is_protected(self, user_id: str) -> bool:
+        """检查用户今日是否受保护。"""
+        today = datetime.date.today().isoformat()
+        prot = self.data.get("protected", {})
+        return prot.get("date") == today and user_id in prot.get("users", [])
+
+    async def set_protected_users(self, user_ids: list):
+        """设置明日受保护的用户列表。"""
+        async with self._lock:
+            tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+            self.data["protected"] = {"date": tomorrow, "users": user_ids}
+            await self._atomic_save()
+
+    async def clean_old_events(self, days_to_keep: int = 7):
+        """清理超过 days_to_keep 天的事件记录。"""
+        async with self._lock:
+            today = datetime.date.today()
+            events = self.data.get("daily_events", {})
+            dates_to_del = [
+                d for d in events
+                if _is_valid_date(d)
+                and (today - datetime.date.fromisoformat(d)).days > days_to_keep
+            ]
+            for d in dates_to_del:
+                del events[d]
+            if dates_to_del:
+                await self._atomic_save()
+
 
 def _is_valid_date(date_str: str) -> bool:
     try:

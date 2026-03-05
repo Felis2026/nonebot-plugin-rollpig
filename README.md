@@ -19,7 +19,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.3.1"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.4.0"
 
 ```
 
@@ -153,3 +153,27 @@ nonebot_plugin_rollpig/
 * 新增小猪时只需在 `pig.json` 添加对象，并将对应图片放到 `image/` 文件夹即可 🐷
 * 图片自动按 id 匹配，无需在 JSON 中写图片后缀 🐖
 
+
+---
+
+## v0.4.0 更新日志
+
+### ✨ 新功能
+- **每日猪圈日报**：每晚 23:20~23:30 自动推送当日统计（最热门猪形态、烧烤狂人、最惨食材、逃脱大师、反噬之王），带随机延迟防风控
+- **保护机制**：被烤 ≥2 次的最惨用户次日自动获得保护，普通烤群友被拦截；后门口令可突破保护
+- **随机烤群友**：从今日抽过猪的群友中随机选一个，走完整的成功/逃脱/反噬判定
+- **自动补抽**：今日烤猪时未抽猪自动补抽，体验更顺畅
+
+### 🐛 修复
+- 修复 @Bot 烤群友不触发 Bot 专属反噬的问题
+
+### 📝 文案
+- 今日烤猪拦截文案（人类/熟食）全面重写，各 6 条
+- 反噬文案（通用）从 4 条扩充至 8 条
+- 后门前缀文案（超级/普通）各从 4 条扩充至 6 条
+- 新增保护拦截/突破文案各 5 条
+- 新增随机烤群友前缀文案 5 条
+- 新增每日总结模板及无数据文案 4 条
+
+### 📦 依赖
+- 启用 `nonebot-plugin-apscheduler`（定时任务支持）
