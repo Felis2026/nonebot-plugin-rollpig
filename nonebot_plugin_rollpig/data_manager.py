@@ -46,9 +46,11 @@ class PigDataManager:
     数据结构：
     - history    : {date: {user_id: pig_id}}  ← 新格式，仅存 pig_id（14天后自动清理）
                    旧版存完整 pig dict，_migrate() 会自动转换
+    - group_rolls: {date: {group_id: {user_id: pig_id}}} ← 群内“今日已抽/已显形”记录
     - collection : {user_id: [pig_id, ...]}   ← 永久保留，图鉴数据
     - usage      : {user_id: timestamp}        ← 烤群友普通模式 CD 时间戳
     - force_usage: {user_id: "YYYY-MM-DD"}    ← 后门口令每日计数
+    - daily_events: {date: [event, ...]}      ← 群内烧烤事件（用于日报）
 
     写操作通过 asyncio.Lock 串行化，文件使用原子替换（.tmp → rename）防止 JSON 损坏。
     """
@@ -62,7 +64,15 @@ class PigDataManager:
 
     def _load(self) -> dict:
         if not self.file.exists():
-            default = {"history": {}, "collection": {}, "usage": {}, "force_usage": {}}
+            default = {
+                "history": {},
+                "group_rolls": {},
+                "collection": {},
+                "usage": {},
+                "force_usage": {},
+                "daily_events": {},
+                "protected": {},
+            }
             self.file.write_text(json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8")
             return default
         try:
@@ -70,14 +80,33 @@ class PigDataManager:
             return self._migrate(raw)
         except Exception as e:
             logger.warning(f"pig_data.json 读取失败，已使用空数据兜底: {e}")
-            return {"history": {}, "collection": {}, "usage": {}, "force_usage": {}}
+            return {
+                "history": {},
+                "group_rolls": {},
+                "collection": {},
+                "usage": {},
+                "force_usage": {},
+                "daily_events": {},
+                "protected": {},
+            }
 
     def _migrate(self, data: dict) -> dict:
         """将旧版 history（存完整 pig dict）迁移为新版（只存 pig_id 字符串）。
         迁移完成后立即同步落盘，防止进程在第一次写入前已退出导致磁盘仍为旧格式。
         """
-        history = data.get("history", {})
+        if not isinstance(data, dict):
+            data = {}
+
         migrated = False
+        for key in ("history", "group_rolls", "collection", "usage", "force_usage", "daily_events"):
+            if not isinstance(data.get(key), dict):
+                data[key] = {}
+                migrated = True
+        if not isinstance(data.get("protected"), dict):
+            data["protected"] = {}
+            migrated = True
+
+        history = data.get("history", {})
         for date_str, records in history.items():
             if not isinstance(records, dict):
                 continue
@@ -86,7 +115,7 @@ class PigDataManager:
                     records[uid] = val["id"]
                     migrated = True
         if migrated:
-            logger.info("pig_data.json 历史数据已自动迁移（完整 dict → pig_id 字符串），开始落盘...")
+            logger.info("pig_data.json 数据结构已自动迁移/补全，开始落盘...")
             self.data = data
             self._sync_save()  # 迁移后立即落盘，防止重启丢失
         return data
@@ -112,13 +141,23 @@ class PigDataManager:
         today = datetime.date.today().isoformat()
         return self.data["history"].get(today, {}).get(user_id)
 
-    async def set_today_pig(self, user_id: str, pig_id: str):
+    def _record_group_roll(self, date_str: str, group_id: str, user_id: str, pig_id: str):
+        """在群维度登记今日已出现的猪形态，用于群内日报与随机烤群友。"""
+        if not group_id:
+            return
+        group_rolls = self.data.setdefault("group_rolls", {})
+        day_rolls = group_rolls.setdefault(date_str, {})
+        group_roll_map = day_rolls.setdefault(group_id, {})
+        group_roll_map[user_id] = pig_id
+
+    async def set_today_pig(self, user_id: str, pig_id: str, group_id: str = ""):
         """记录今日抽到的 pig_id，并同步将其写入图鉴（永久保留）。"""
         async with self._lock:
             today = datetime.date.today().isoformat()
             if today not in self.data["history"]:
                 self.data["history"][today] = {}
             self.data["history"][today][user_id] = pig_id
+            self._record_group_roll(today, group_id, user_id, pig_id)
 
             # 图鉴：永久保留，不受 14 天历史清理影响
             col = self.data.setdefault("collection", {})
@@ -126,6 +165,15 @@ class PigDataManager:
             if pig_id not in user_col:
                 user_col.append(pig_id)
 
+            await self._atomic_save()
+
+    async def mark_group_roll_seen(self, user_id: str, pig_id: str, group_id: str):
+        """将已有的今日形态登记到当前群，避免群内统计漏记。"""
+        if not group_id:
+            return
+        async with self._lock:
+            today = datetime.date.today().isoformat()
+            self._record_group_roll(today, group_id, user_id, pig_id)
             await self._atomic_save()
 
     def get_pig_by_date(self, user_id: str, date_str: str) -> Optional[str]:
@@ -139,14 +187,24 @@ class PigDataManager:
         """清理超过 days_to_keep 天的历史记录（不影响图鉴数据）。"""
         async with self._lock:
             today = datetime.date.today()
-            dates_to_del = [
+            history_dates_to_del = [
                 d for d in self.data["history"]
                 if _is_valid_date(d)  # 必须先过滤非法日期键，再做计算（防止 ValueError）
                 and (today - datetime.date.fromisoformat(d)).days > days_to_keep
             ]
-            for d in dates_to_del:
+            for d in history_dates_to_del:
                 del self.data["history"][d]
-            if dates_to_del:
+
+            group_rolls = self.data.get("group_rolls", {})
+            group_dates_to_del = [
+                d for d in group_rolls
+                if _is_valid_date(d)
+                and (today - datetime.date.fromisoformat(d)).days > days_to_keep
+            ]
+            for d in group_dates_to_del:
+                del group_rolls[d]
+
+            if history_dates_to_del or group_dates_to_del:
                 await self._atomic_save()
 
     # ---- 烤群友 普通模式 CD ----
@@ -207,7 +265,7 @@ class PigDataManager:
                                food: str = "", group_id: str = ""):
         """
         记录一次烤群友事件。
-        event_type: "success" / "escape" / "backfire" / "bot_backfire"
+        event_type: "success" / "escape" / "backfire" / "bot_backfire" / "self_roast"
         """
         async with self._lock:
             today = datetime.date.today().isoformat()
@@ -224,13 +282,39 @@ class PigDataManager:
             })
             await self._atomic_save()
 
-    def get_daily_events(self, date_str: Optional[str] = None) -> list:
+    def get_daily_events(self, date_str: Optional[str] = None, group_id: Optional[str] = None) -> list:
         """获取指定日期（默认今天）的所有烤群友事件。"""
         if not date_str:
             date_str = datetime.date.today().isoformat()
-        return self.data.get("daily_events", {}).get(date_str, [])
+        events = self.data.get("daily_events", {}).get(date_str, [])
+        if not group_id:
+            return events
+        return [e for e in events if e.get("group_id") == group_id]
 
-    def get_daily_summary(self, date_str: Optional[str] = None) -> dict:
+    def get_group_rolls(self, group_id: str, date_str: Optional[str] = None) -> dict:
+        """获取指定群在某天登记过的今日形态。"""
+        if not date_str:
+            date_str = datetime.date.today().isoformat()
+        return self.data.get("group_rolls", {}).get(date_str, {}).get(group_id, {})
+
+    def get_active_group_ids(self, date_str: Optional[str] = None) -> set[str]:
+        """获取指定日期内有抽猪或烧烤活动的群号集合。"""
+        if not date_str:
+            date_str = datetime.date.today().isoformat()
+
+        event_groups = {
+            str(e.get("group_id"))
+            for e in self.get_daily_events(date_str)
+            if e.get("group_id")
+        }
+        roll_groups = {
+            str(group_id)
+            for group_id in self.data.get("group_rolls", {}).get(date_str, {}).keys()
+            if group_id
+        }
+        return event_groups | roll_groups
+
+    def get_daily_summary(self, date_str: Optional[str] = None, group_id: Optional[str] = None) -> dict:
         """
         汇总指定日期的烤群友数据，返回:
         {
@@ -249,9 +333,10 @@ class PigDataManager:
             "backfire_king_count": int,
         }
         """
-        events = self.get_daily_events(date_str)
-        if not events:
-            return {"total": 0}
+        roll_stats = self._get_roll_stats(date_str, group_id=group_id)
+        events = self.get_daily_events(date_str, group_id=group_id)
+        if not events and roll_stats.get("roll_count", 0) == 0:
+            return {"total": 0, **roll_stats}
 
         from collections import Counter
         roasted_counter: Counter = Counter()       # 被烤次数
@@ -270,7 +355,10 @@ class PigDataManager:
 
             etype = e.get("type", "")
             if etype == "success":
-                roasted_counter[t_id] += 1
+                attacker_counter[a_id] += 1
+                if a_id and t_id and a_id != t_id:
+                    roasted_counter[t_id] += 1
+            elif etype == "self_roast":
                 attacker_counter[a_id] += 1
             elif etype == "escape":
                 escape_counter[t_id] += 1
@@ -296,15 +384,18 @@ class PigDataManager:
             "most_active_id": ma_id, "most_active_name": ma_name, "most_active_count": ma_count,
             "escape_king_id": ek_id, "escape_king_name": ek_name, "escape_king_count": ek_count,
             "backfire_king_id": bk_id, "backfire_king_name": bk_name, "backfire_king_count": bk_count,
-            **self._get_roll_stats(date_str),
+            **roll_stats,
         }
 
-    def _get_roll_stats(self, date_str: Optional[str] = None) -> dict:
+    def _get_roll_stats(self, date_str: Optional[str] = None, group_id: Optional[str] = None) -> dict:
         """从 history 中统计今日抽猪信息。"""
         from collections import Counter
         if not date_str:
             date_str = datetime.date.today().isoformat()
-        today_rolls = self.data.get("history", {}).get(date_str, {})
+        if group_id:
+            today_rolls = self.get_group_rolls(group_id, date_str)
+        else:
+            today_rolls = self.data.get("history", {}).get(date_str, {})
         if not today_rolls:
             return {"roll_count": 0}
 
