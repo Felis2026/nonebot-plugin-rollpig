@@ -19,7 +19,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.4.0"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.5.0"
 
 ```
 
@@ -52,7 +52,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.4
 **今日烤猪** - 把今天的猪做成美食（慎用！）🔥
 
 * 支持 **AI 生成**：开启开关且配置 Key 后，会根据猪猪类型生成“烤后感言”
-* 若你今天是 **人类** 或 **熟食形态**（烤猪/培根/猪排/猪肉串），会被拦截，不再继续烧烤
+* 若你今天是 **人类** 或 **熟食形态**（如烤猪/培根/猪排/猪肉串/烤乳猪/猪堡包），会被拦截，不再继续烧烤
 
 **烤群友** - 在群聊中烤一位群友（需 `@` 或回复目标）🍢
 
@@ -91,13 +91,38 @@ ROLLPIG_DEEPSEEK_BASE=https://api.deepseek.com
 # (可选) 烤群友普通模式 CD（单位小时，默认 8）
 ROLLPIG_ROAST_COOLDOWN_HOURS=8
 
+# 如果你想启用云同步，可自行部署 rollpig-cloud：
+# https://github.com/Felis2026/rollpig-cloud
+# 也可以联系维护者（QQ：3397152010）申请接入现有 API
+#
+# (可选) 存储后端，默认 local；启用云同步时改为 cloud
+ROLLPIG_STORAGE_BACKEND=cloud
+
+# (可选) rollpig-cloud 服务地址
+ROLLPIG_CLOUD_API_URL=http://127.0.0.1:8011
+
+# (可选) rollpig-cloud Bearer Token
+ROLLPIG_CLOUD_TOKEN=replace-with-token
+
+# (可选) 云端请求超时（秒）
+ROLLPIG_CLOUD_TIMEOUT=3.0
+
+# (可选) 云端请求严格模式，默认 true
+ROLLPIG_CLOUD_STRICT_MODE=true
+
 ```
 
 说明：
 
 * 仅设置 `ROLLPIG_DEEPSEEK_KEY` 不会触发 AI，需同时开启 `ROLLPIG_AI_ENABLED=true`
 * 未开启 AI 或未配置 Key 时，会自动回退到本地文案模板
+* 后续可能会继续扩展为“云端同步文案库”模式；当前版本仍以本地模板 / AI 生成两种方式为主
 * `ROLLPIG_ROAST_COOLDOWN_HOURS` 仅影响普通模式；后门模式不会改写普通 CD 时间戳
+* 未配置云端时，插件默认继续使用本地 `pig_data.json` 存储，不影响单 Bot 正常运行
+* `ROLLPIG_STORAGE_BACKEND=cloud` 时，`今日小猪`、`普通 CD`、`后门次数` 将在多 Bot 间同步；日报与保护按群聚合/生效
+* `ROLLPIG_CLOUD_TIMEOUT` 与 `ROLLPIG_CLOUD_STRICT_MODE` 一般保持默认即可，只有明确需要调试云端行为时再调整
+* `ROLLPIG_CLOUD_STRICT_MODE=false` 的含义是：读接口可使用安全兜底值；关键写接口不会偷偷回退本地，而是向用户提示“稍后再试”，避免多 Bot 数据脑裂
+* 未接入外部控制台时，群功能与日报默认开启；宿主项目可按需接管开关
 
 ---
 
@@ -137,13 +162,20 @@ nonebot_plugin_rollpig/resource
 ```
 nonebot_plugin_rollpig/
 ├─ __init__.py
-├─ config.py         # 配置文件
-├─ roast_manager.py  # AI 烤猪管理器
+├─ config.py           # 配置模型
+├─ data_manager.py     # 本地 JSON 存储实现
+├─ roast_manager.py    # AI 烤猪与文案生成
+├─ runtime.py          # 宿主适配 / 群开关 / 运行时工具
+├─ summary_service.py  # 每日总结聚合
+├─ store/
+│   ├─ base.py         # 存储接口定义
+│   ├─ factory.py      # local / cloud 后端选择
+│   ├─ local_json.py   # 本地存储适配
+│   └─ cloud.py        # rollpig-cloud 云端适配
 ├─ resource/
 │   ├─ pig.json
 │   └─ image/
 │       └─ pig.png
-
 ```
 
 ---
@@ -155,6 +187,24 @@ nonebot_plugin_rollpig/
 
 
 ---
+
+## v0.5.0 更新日志
+
+### ✨ 新功能
+- **云端同步存储**：支持通过 `rollpig-cloud` 同步今日小猪、普通烤群友 CD、后门次数、群维度日报与保护机制
+- **多 Bot / 多群协同**：在接入云端后，可跨 Bot 共享核心状态，减少多实例部署时的数据割裂
+
+### ♻️ 重构
+- **存储层重构**：抽离本地存储与云端存储接口，统一读写入口，便于后续继续扩展
+- **运行时职责拆分**：新增运行时适配、摘要服务、存储工厂等模块，减少主入口文件耦合
+- **宿主接入友好化**：为外部控制台预留群开关 / 日报开关接入点，未接入时保持默认可用
+
+### 🐖 资源更新
+- 新增 6 只图鉴小猪：`储蓄罐`、`烤乳猪`、`早八猪`、`复读猪`、`猪穆朗玛`、`猪堡包`
+
+### 📝 文档与兼容性
+- README 补充云端配置说明与本地 / 云端两种运行方式说明
+- `nonebot-plugin-htmlrender` 依赖下限调整为 `0.6.0`，降低集成门槛
 
 ## v0.4.0 更新日志
 
@@ -177,3 +227,27 @@ nonebot_plugin_rollpig/
 
 ### 📦 依赖
 - 启用 `nonebot-plugin-apscheduler`（定时任务支持）
+
+---
+
+## 更早版本更新摘要
+
+### v0.3.1
+- 新增 11 只图鉴小猪及相关文案资源
+
+### v0.3.0
+- 稳定烧烤流程，完善人类 / 熟食拦截逻辑
+- 统一 AI 启用条件与回退逻辑，增强异常处理与文档同步
+
+### v0.2.9
+- 同步上游“找猪”与“随机小猪多张连发”特性
+- 新增 `烤群友` 与文案模板系统
+
+### v0.2.8
+- 新增 AI 烤猪能力，接入 DeepSeek
+- 增加相关 `.env` 配置与文档说明
+
+### v0.2.7
+- 引入异步网络请求
+- 新增昨日 / 明日 / 本周小猪、今日烤猪、我的猪圈等能力
+- 引入长图总结相关依赖

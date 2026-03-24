@@ -48,7 +48,17 @@ TOMORROW_TEXTS = [
 ]
 
 # --- 熟食形态 ID 列表（烧烤/烤群友相关拦截逻辑） ---
-FOOD_PIG_IDS = ["roasted-pig", "bacon", "mc_porkchop", "pork-skewer", "char-siu", "pork-floss"]
+# 新增资源中的熟食类形态也必须并入这里，否则会绕过“熟食禁止再烤”的统一拦截。
+FOOD_PIG_IDS = [
+    "roasted-pig",
+    "bacon",
+    "mc_porkchop",
+    "pork-skewer",
+    "char-siu",
+    "pork-floss",
+    "suckling-pig",
+    "burger-pig",
+]
 
 # --- 人类形态 ID ---
 HUMAN_PIG_ID = "human"

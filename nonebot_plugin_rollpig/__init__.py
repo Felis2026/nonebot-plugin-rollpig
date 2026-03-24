@@ -2,6 +2,7 @@ import json
 import random
 import datetime
 import time
+from functools import wraps
 import httpx
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,11 @@ from nonebot_plugin_htmlrender import template_to_pic
 # 本地模块（在 require() 之后 import）
 from .config import Config
 from .roast_manager import roast_manager
-from .data_manager import data_manager
+from .runtime import is_daily_summary_enabled, is_group_rollpig_enabled, resolve_roast_cooldown_seconds
+from .store import store
+from .store.cloud import CloudStoreError
+from .store.models import RoastEvent
+from .summary_service import build_daily_summary
 from .texts import (
     TOMORROW_TEXTS,
     FOOD_PIG_IDS, HUMAN_PIG_ID,
@@ -195,7 +200,7 @@ def get_event_user_name(event: Event) -> str:
 async def get_group_roll_candidates(bot: Bot, group_id: int, exclude_ids: set[str]) -> list[str]:
     """优先按当前群成员范围筛候选；接口异常时回退到群内已登记过的今日形态。"""
     today = datetime.date.today().isoformat()
-    today_rolls = data_manager.data.get("history", {}).get(today, {})
+    today_rolls = await store.get_daily_rolls(today)
 
     try:
         members = await bot.call_api("get_group_member_list", group_id=group_id)
@@ -207,8 +212,67 @@ async def get_group_roll_candidates(bot: Bot, group_id: int, exclude_ids: set[st
         return [uid for uid in today_rolls if uid in member_ids and uid not in exclude_ids]
     except Exception as e:
         logger.debug(f"获取群成员列表失败: group={group_id} error={e}")
-        group_rolls = data_manager.get_group_rolls(str(group_id), today)
+        group_rolls = await store.get_group_rolls(str(group_id), today)
         return [uid for uid in group_rolls if uid not in exclude_ids]
+
+
+def format_cooldown_message(remaining_seconds: int) -> str:
+    remaining = max(0, int(remaining_seconds))
+    minutes, seconds = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    time_str = f"{hours}小时{minutes}分" if hours > 0 else f"{minutes}分{seconds}秒"
+    return f"技能冷却中！还需要休息 {time_str} 才能再次烧烤。"
+
+
+# ================================ 群开关守卫 ================================ #
+# 这里统一拦截群聊中的 rollpig 指令入口。
+# 一旦宿主项目（如 nekobot_v2）给 runtime 挂上了外部群开关检查器，
+# 未启用的群将直接静默跳过；没有接控制台时则默认放行。
+def guard_group_enabled(matcher):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            event = kwargs.get("event")
+            if event is None:
+                for arg in args:
+                    if isinstance(arg, Event):
+                        event = arg
+                        break
+
+            group_id = get_event_group_id(event) if isinstance(event, Event) else ""
+            if group_id and not is_group_rollpig_enabled(group_id):
+                logger.debug(f"rollpig 群功能未启用，跳过处理: group={group_id}")
+                await matcher.finish()
+
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def guard_store_errors(matcher, message: str = "猪圈云账本暂时离线，请稍后再试。"):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            event = kwargs.get("event")
+            if event is None:
+                for arg in args:
+                    if isinstance(arg, Event):
+                        event = arg
+                        break
+
+            try:
+                return await func(*args, **kwargs)
+            except CloudStoreError as error:
+                logger.warning(f"rollpig cloud store unavailable: {error}")
+                if event is not None:
+                    await matcher.finish(MessageSegment.reply(event.message_id) + message)
+                await matcher.finish(message)
+
+        return wrapper
+
+    return decorator
 
 
 async def ensure_pighub_images_loaded() -> bool:
@@ -294,22 +358,27 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
 cmd_today = on_command("今天是什么小猪", aliases={"今日小猪"}, block=True)
 
 @cmd_today.handle()
+@guard_group_enabled(cmd_today)
+@guard_store_errors(cmd_today)
 async def _(event: Event):
     user_id = str(event.user_id)
     group_id = get_event_group_id(event)
-    pig_id = data_manager.get_today_pig(user_id)
+    pig_id = await store.get_daily_roll(user_id)
     pig = get_pig_by_id(pig_id)
 
     if not pig:
         if not PIG_LIST:
             await cmd_today.finish("猪圈塌房了（数据缺失）")
             return
-        pig = random.choice(PIG_LIST)
-        await data_manager.set_today_pig(user_id, pig["id"], group_id=group_id)
-        if random.randint(1, 20) == 1:
-            await data_manager.clean_old_history()
+        proposed_pig = random.choice(PIG_LIST)
+        resolved_pig_id, _ = await store.get_or_create_daily_roll(
+            user_id,
+            proposed_pig["id"],
+            group_id=group_id,
+        )
+        pig = get_pig_by_id(resolved_pig_id) or proposed_pig
     elif group_id:
-        await data_manager.mark_group_roll_seen(user_id, pig["id"], group_id)
+        await store.mark_group_roll_seen(user_id, pig["id"], group_id)
 
     await send_rendered_pig(cmd_today, event, pig)
 
@@ -318,6 +387,7 @@ async def _(event: Event):
 cmd_roll = on_command("随机小猪", block=True)
 
 @cmd_roll.handle()
+@guard_group_enabled(cmd_roll)
 async def _(bot: Bot, event: Event, args: Message = CommandArg()):
     if not await ensure_pighub_images_loaded():
         await cmd_roll.finish("连不上 PigHub...")
@@ -378,6 +448,7 @@ async def _(bot: Bot, event: Event, args: Message = CommandArg()):
 cmd_find = on_command("找猪", aliases={"搜猪"}, block=True)
 
 @cmd_find.handle()
+@guard_group_enabled(cmd_find)
 async def _(bot: Bot, event: Event, args: Message = CommandArg()):
     if not await ensure_pighub_images_loaded():
         await cmd_find.finish("连不上 PigHub，请稍后再试。")
@@ -432,6 +503,7 @@ async def _(bot: Bot, event: Event, args: Message = CommandArg()):
 cmd_tmr = on_command("明日小猪", block=True)
 
 @cmd_tmr.handle()
+@guard_group_enabled(cmd_tmr)
 async def _(event: Event):
     await cmd_tmr.finish(MessageSegment.reply(event.message_id) + random.choice(TOMORROW_TEXTS))
 
@@ -440,10 +512,12 @@ async def _(event: Event):
 cmd_yest = on_command("昨日小猪", block=True)
 
 @cmd_yest.handle()
+@guard_group_enabled(cmd_yest)
+@guard_store_errors(cmd_yest)
 async def _(event: Event):
     user_id = str(event.user_id)
     yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-    pig = get_pig_by_id(data_manager.get_pig_by_date(user_id, yesterday))
+    pig = get_pig_by_id(await store.get_pig_by_date(user_id, yesterday))
 
     if not pig:
         await cmd_yest.finish(MessageSegment.reply(event.message_id) + "你昨天没抽猪。")
@@ -455,22 +529,29 @@ async def _(event: Event):
 cmd_roast = on_command("今日烤猪", block=True)
 
 @cmd_roast.handle()
+@guard_group_enabled(cmd_roast)
+@guard_store_errors(cmd_roast)
 async def _(event: Event):
     user_id = str(event.user_id)
     group_id = get_event_group_id(event)
     attacker_name = get_event_user_name(event)
-    original_pig = get_pig_by_id(data_manager.get_today_pig(user_id))
+    original_pig = get_pig_by_id(await store.get_daily_roll(user_id))
 
     auto_roll_hint = ""
     if not original_pig:
         if not PIG_LIST:
             await cmd_roast.finish(MessageSegment.reply(event.message_id) + "猪圈埋房了（数据缺失）")
             return
-        original_pig = random.choice(PIG_LIST)
-        await data_manager.set_today_pig(user_id, original_pig["id"], group_id=group_id)
+        proposed_pig = random.choice(PIG_LIST)
+        resolved_pig_id, _ = await store.get_or_create_daily_roll(
+            user_id,
+            proposed_pig["id"],
+            group_id=group_id,
+        )
+        original_pig = get_pig_by_id(resolved_pig_id) or proposed_pig
         auto_roll_hint = random.choice(AUTO_ROLL_ROAST_TEXTS).format(name=original_pig["name"]) + "\n"
     elif group_id:
-        await data_manager.mark_group_roll_seen(user_id, original_pig["id"], group_id)
+        await store.mark_group_roll_seen(user_id, original_pig["id"], group_id)
 
     if is_human_pig(original_pig):
         await cmd_roast.finish(
@@ -497,10 +578,16 @@ async def _(event: Event):
     roasted_pig_data["analysis"] = roast_text
 
     if group_id:
-        await data_manager.log_roast_event(
-            "self_roast", user_id, user_id,
-            attacker_name=attacker_name, target_name=attacker_name,
-            food=food_pig_template["name"], group_id=group_id,
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="self_roast",
+                attacker_id=user_id,
+                target_id=user_id,
+                attacker_name=attacker_name,
+                target_name=attacker_name,
+                food=food_pig_template["name"],
+                group_id=group_id,
+            )
         )
     await send_rendered_pig(cmd_roast, event, roasted_pig_data, extra_text=auto_roll_hint)
 
@@ -509,15 +596,17 @@ async def _(event: Event):
 cmd_roast_member = on_command("烤群友", block=True)
 
 @cmd_roast_member.handle()
+@guard_group_enabled(cmd_roast_member)
+@guard_store_errors(cmd_roast_member)
 async def _(bot: Bot, event: GroupMessageEvent):
     attacker_id = str(event.user_id)
     attacker_name = event.sender.card or event.sender.nickname
     group_id = str(event.group_id)
     force_mode = detect_force_roast_mode(event.get_plaintext(), attacker_id)
-    attacker_pig = get_pig_by_id(data_manager.get_today_pig(attacker_id))
+    attacker_pig = get_pig_by_id(await store.get_daily_roll(attacker_id))
 
     if attacker_pig:
-        await data_manager.mark_group_roll_seen(attacker_id, attacker_pig["id"], group_id)
+        await store.mark_group_roll_seen(attacker_id, attacker_pig["id"], group_id)
 
     if force_mode == "super_denied":
         await cmd_roast_member.finish(
@@ -566,24 +655,30 @@ async def _(bot: Bot, event: GroupMessageEvent):
         food_name = food_pig["name"] if food_pig else "美食"
         bot_text = random.choice(ROAST_BOT_TEXTS).format(attacker=attacker_name, food=food_name)
         logger.info(f"[烤群友→Bot] 特殊反噬 | 凶手={attacker_name}({attacker_id}) 变成={food_name}")
-        await data_manager.log_roast_event(
-            "bot_backfire", attacker_id, target_id,
-            attacker_name=attacker_name, target_name=target_name,
-            food=food_name, group_id=group_id,
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="bot_backfire",
+                attacker_id=attacker_id,
+                target_id=target_id,
+                attacker_name=attacker_name,
+                target_name=target_name,
+                food=food_name,
+                group_id=group_id,
+            )
         )
         await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + bot_text)
         return
     # 读取目标形态（后门模式也不绕过此检查）
-    target_pig = get_pig_by_id(data_manager.get_today_pig(target_id))
+    target_pig = get_pig_by_id(await store.get_daily_roll(target_id))
     if not target_pig:
         await cmd_roast_member.finish(
             MessageSegment.reply(event.message_id) + f"【{target_name}】今天还没抽猪，没法下嘴！"
         )
         return
-    await data_manager.mark_group_roll_seen(target_id, target_pig["id"], group_id)
+    await store.mark_group_roll_seen(target_id, target_pig["id"], group_id)
 
     # 保护检查：被烤最多的用户次日受保护（后门可突破）
-    if data_manager.is_protected(target_id):
+    if await store.is_protected(group_id, target_id):
         if force_mode in {"normal", "super"}:
             break_text = random.choice(PROTECTION_BREAK_TEXTS).format(target=target_name)
             logger.info(f"[烤群友] 保护被突破 | 凶手={attacker_name}({attacker_id}) 目标={target_name}({target_id})")
@@ -611,17 +706,20 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # 模式化限制/计数
     if force_mode == "normal":
-        if not data_manager.check_force_roast_usage(attacker_id):
+        if not await store.consume_force_usage(attacker_id):
             reject_text = pick_force_limit_text(attacker_name, target_name)
             await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + reject_text)
             return
-        await data_manager.update_force_roast_usage(attacker_id)
     elif force_mode is None:
-        is_available, tip_msg = data_manager.check_roast_usage(attacker_id)
-        if not is_available:
-            await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + tip_msg)
+        cooldown_result = await store.consume_roast_cooldown(
+            attacker_id,
+            cooldown_seconds=resolve_roast_cooldown_seconds(),
+        )
+        if not cooldown_result.allowed:
+            await cmd_roast_member.finish(
+                MessageSegment.reply(event.message_id) + format_cooldown_message(cooldown_result.remaining_seconds)
+            )
             return
-        await data_manager.update_roast_usage(attacker_id)
     # super 模式：无限制，不消耗后门次数，不走 CD
 
     # --- 后门模式：必定成功 ---
@@ -642,10 +740,16 @@ async def _(bot: Bot, event: GroupMessageEvent):
             f"[烤群友] 后门成功 | 凶手={attacker_name}({attacker_id}) "
             f"目标={target_name}({target_id}) 模式={force_mode} 结果={food_pig_template['name']}"
         )
-        await data_manager.log_roast_event(
-            "success", attacker_id, target_id,
-            attacker_name=attacker_name, target_name=target_name,
-            food=food_pig_template["name"], group_id=str(event.group_id),
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="success",
+                attacker_id=attacker_id,
+                target_id=target_id,
+                attacker_name=attacker_name,
+                target_name=target_name,
+                food=food_pig_template["name"],
+                group_id=str(event.group_id),
+            )
         )
         roasted_data = food_pig_template.copy()
         roasted_data["analysis"] = text
@@ -671,10 +775,16 @@ async def _(bot: Bot, event: GroupMessageEvent):
             f"[烤群友] 成功 | 凶手={attacker_name}({attacker_id}) "
             f"目标={target_name}({target_id}) 结果={food_pig_template['name']}"
         )
-        await data_manager.log_roast_event(
-            "success", attacker_id, target_id,
-            attacker_name=attacker_name, target_name=target_name,
-            food=food_pig_template["name"], group_id=str(event.group_id),
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="success",
+                attacker_id=attacker_id,
+                target_id=target_id,
+                attacker_name=attacker_name,
+                target_name=target_name,
+                food=food_pig_template["name"],
+                group_id=str(event.group_id),
+            )
         )
         roasted_data = food_pig_template.copy()
         roasted_data["analysis"] = text
@@ -686,10 +796,15 @@ async def _(bot: Bot, event: GroupMessageEvent):
         logger.info(
             f"[烤群友] 逃脱 | 凶手={attacker_name}({attacker_id}) 目标={target_name}({target_id})"
         )
-        await data_manager.log_roast_event(
-            "escape", attacker_id, target_id,
-            attacker_name=attacker_name, target_name=target_name,
-            group_id=str(event.group_id),
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="escape",
+                attacker_id=attacker_id,
+                target_id=target_id,
+                attacker_name=attacker_name,
+                target_name=target_name,
+                group_id=str(event.group_id),
+            )
         )
         await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + escape_text)
 
@@ -710,10 +825,16 @@ async def _(bot: Bot, event: GroupMessageEvent):
                 f"[烤群友] 反噬 | 凶手={attacker_name}({attacker_id}) "
                 f"目标={target_name}({target_id}) 凶手变成={food_pig_template['name']}"
             )
-            await data_manager.log_roast_event(
-                "backfire", attacker_id, target_id,
-                attacker_name=attacker_name, target_name=target_name,
-                food=food_pig_template["name"], group_id=group_id,
+            await store.append_roast_event(
+                RoastEvent(
+                    event_type="backfire",
+                    attacker_id=attacker_id,
+                    target_id=target_id,
+                    attacker_name=attacker_name,
+                    target_name=target_name,
+                    food=food_pig_template["name"],
+                    group_id=group_id,
+                )
             )
             roasted_data = food_pig_template.copy()
             roasted_data["analysis"] = fail_text
@@ -724,10 +845,15 @@ async def _(bot: Bot, event: GroupMessageEvent):
                 f"[烤群友] 反噬(文字) | 凶手={attacker_name}({attacker_id}) "
                 f"目标={target_name}({target_id})"
             )
-            await data_manager.log_roast_event(
-                "backfire", attacker_id, target_id,
-                attacker_name=attacker_name, target_name=target_name,
-                group_id=group_id,
+            await store.append_roast_event(
+                RoastEvent(
+                    event_type="backfire",
+                    attacker_id=attacker_id,
+                    target_id=target_id,
+                    attacker_name=attacker_name,
+                    target_name=target_name,
+                    group_id=group_id,
+                )
             )
             await cmd_roast_member.finish(MessageSegment.reply(event.message_id) + fail_text)
 
@@ -736,14 +862,16 @@ async def _(bot: Bot, event: GroupMessageEvent):
 cmd_random_roast = on_command("随机烤群友", aliases={"随机烤猪", "抽个群友烤了"}, block=True)
 
 @cmd_random_roast.handle()
+@guard_group_enabled(cmd_random_roast)
+@guard_store_errors(cmd_random_roast)
 async def _(bot: Bot, event: GroupMessageEvent):
     attacker_id = str(event.user_id)
     attacker_name = event.sender.card or event.sender.nickname
     group_id = str(event.group_id)
-    attacker_pig = get_pig_by_id(data_manager.get_today_pig(attacker_id))
+    attacker_pig = get_pig_by_id(await store.get_daily_roll(attacker_id))
 
     if attacker_pig:
-        await data_manager.mark_group_roll_seen(attacker_id, attacker_pig["id"], group_id)
+        await store.mark_group_roll_seen(attacker_id, attacker_pig["id"], group_id)
 
     bot_id = str(event.self_id)
     candidates = await get_group_roll_candidates(bot, event.group_id, {attacker_id, bot_id})
@@ -765,23 +893,27 @@ async def _(bot: Bot, event: GroupMessageEvent):
         pass
 
     # 检查攻击者 CD
-    is_available, tip_msg = data_manager.check_roast_usage(attacker_id)
-    if not is_available:
-        await cmd_random_roast.finish(MessageSegment.reply(event.message_id) + tip_msg)
+    cooldown_result = await store.consume_roast_cooldown(
+        attacker_id,
+        cooldown_seconds=resolve_roast_cooldown_seconds(),
+    )
+    if not cooldown_result.allowed:
+        await cmd_random_roast.finish(
+            MessageSegment.reply(event.message_id) + format_cooldown_message(cooldown_result.remaining_seconds)
+        )
         return
-    await data_manager.update_roast_usage(attacker_id)
 
     # 读取目标形态
-    target_pig = get_pig_by_id(data_manager.get_today_pig(target_id))
+    target_pig = get_pig_by_id(await store.get_daily_roll(target_id))
     if not target_pig:
         await cmd_random_roast.finish(
             MessageSegment.reply(event.message_id) + f"系统随机选中了【{target_name}】，但对方的猪数据异常。"
         )
         return
-    await data_manager.mark_group_roll_seen(target_id, target_pig["id"], group_id)
+    await store.mark_group_roll_seen(target_id, target_pig["id"], group_id)
 
     # 保护检查
-    if data_manager.is_protected(target_id):
+    if await store.is_protected(group_id, target_id):
         prot_text = random.choice(PROTECTION_BLOCK_TEXTS).format(target=target_name)
         await cmd_random_roast.finish(
             MessageSegment.reply(event.message_id)
@@ -824,10 +956,16 @@ async def _(bot: Bot, event: GroupMessageEvent):
             f"[随机烤群友] 成功 | 凶手={attacker_name}({attacker_id}) "
             f"目标={target_name}({target_id}) 结果={food_pig_template['name']}"
         )
-        await data_manager.log_roast_event(
-            "success", attacker_id, target_id,
-            attacker_name=attacker_name, target_name=target_name,
-            food=food_pig_template["name"], group_id=str(event.group_id),
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="success",
+                attacker_id=attacker_id,
+                target_id=target_id,
+                attacker_name=attacker_name,
+                target_name=target_name,
+                food=food_pig_template["name"],
+                group_id=str(event.group_id),
+            )
         )
         roasted_data = food_pig_template.copy()
         roasted_data["analysis"] = text
@@ -839,10 +977,15 @@ async def _(bot: Bot, event: GroupMessageEvent):
         logger.info(
             f"[随机烤群友] 逃脱 | 凶手={attacker_name}({attacker_id}) 目标={target_name}({target_id})"
         )
-        await data_manager.log_roast_event(
-            "escape", attacker_id, target_id,
-            attacker_name=attacker_name, target_name=target_name,
-            group_id=str(event.group_id),
+        await store.append_roast_event(
+            RoastEvent(
+                event_type="escape",
+                attacker_id=attacker_id,
+                target_id=target_id,
+                attacker_name=attacker_name,
+                target_name=target_name,
+                group_id=str(event.group_id),
+            )
         )
         await cmd_random_roast.finish(MessageSegment.reply(event.message_id) + intro + escape_text)
 
@@ -861,10 +1004,16 @@ async def _(bot: Bot, event: GroupMessageEvent):
                 f"[随机烤群友] 反噬 | 凶手={attacker_name}({attacker_id}) "
                 f"目标={target_name}({target_id}) 凶手变成={food_pig_template['name']}"
             )
-            await data_manager.log_roast_event(
-                "backfire", attacker_id, target_id,
-                attacker_name=attacker_name, target_name=target_name,
-                food=food_pig_template["name"], group_id=group_id,
+            await store.append_roast_event(
+                RoastEvent(
+                    event_type="backfire",
+                    attacker_id=attacker_id,
+                    target_id=target_id,
+                    attacker_name=attacker_name,
+                    target_name=target_name,
+                    food=food_pig_template["name"],
+                    group_id=group_id,
+                )
             )
             roasted_data = food_pig_template.copy()
             roasted_data["analysis"] = fail_text
@@ -875,10 +1024,15 @@ async def _(bot: Bot, event: GroupMessageEvent):
                 f"[随机烤群友] 反噬(文字) | 凶手={attacker_name}({attacker_id}) "
                 f"目标={target_name}({target_id})"
             )
-            await data_manager.log_roast_event(
-                "backfire", attacker_id, target_id,
-                attacker_name=attacker_name, target_name=target_name,
-                group_id=group_id,
+            await store.append_roast_event(
+                RoastEvent(
+                    event_type="backfire",
+                    attacker_id=attacker_id,
+                    target_id=target_id,
+                    attacker_name=attacker_name,
+                    target_name=target_name,
+                    group_id=group_id,
+                )
             )
             await cmd_random_roast.finish(MessageSegment.reply(event.message_id) + intro + fail_text)
 
@@ -887,9 +1041,11 @@ async def _(bot: Bot, event: GroupMessageEvent):
 cmd_sty = on_command("我的猪圈", aliases={"我的小猪"}, block=True)
 
 @cmd_sty.handle()
+@guard_group_enabled(cmd_sty)
+@guard_store_errors(cmd_sty)
 async def _(event: Event):
     user_id = str(event.user_id)
-    collection = data_manager.get_user_collection(user_id)
+    collection = await store.get_user_collection(user_id)
     total_pigs = len(PIG_LIST)
     user_count = len(collection)
 
@@ -917,6 +1073,8 @@ async def _(event: Event):
 cmd_week = on_command("本周小猪", block=True)
 
 @cmd_week.handle()
+@guard_group_enabled(cmd_week)
+@guard_store_errors(cmd_week)
 async def _(event: Event):
     if not HAS_PIL:
         await cmd_week.finish("Bot 未安装 PIL 库。")
@@ -927,7 +1085,7 @@ async def _(event: Event):
     images_to_merge = []
     for i in range(7):
         d = today - datetime.timedelta(days=(6 - i))
-        pig = get_pig_by_id(data_manager.get_pig_by_date(user_id, d.isoformat()))
+        pig = get_pig_by_id(await store.get_pig_by_date(user_id, d.isoformat()))
         if pig:
             img_file = find_image_file(pig["id"])
             if img_file:
@@ -975,7 +1133,7 @@ from nonebot_plugin_apscheduler import scheduler
 
 
 def build_daily_summary_text(summary: dict) -> str:
-    """将 data_manager.get_daily_summary() 的结果拼成文案。"""
+    """将按群聚合后的日报结果拼成文案。"""
     roll_count = summary.get("roll_count", 0)
     roast_total = summary.get("total", 0)
 
@@ -1031,25 +1189,35 @@ async def daily_summary_job():
     logger.info(f"[每日总结] 定时触发，随机延迟 {delay} 秒后推送")
     await asyncio.sleep(delay)
     try:
-        active_groups = data_manager.get_active_group_ids()
+        active_groups = await store.get_active_group_ids()
         if not active_groups:
             logger.info("[每日总结] 今日无活跃群，跳过推送")
             return
 
+        # ================================ 控制台开关过滤 ================================ #
+        # 如果宿主项目接入了 admin_console 群开关，这里必须在定时任务层同步收口：
+        # 未启用的群既不推日报，也不写次日保护名单，保证“关闭就是彻底关闭”。
+        enabled_active_groups = [
+            group_id for group_id in sorted(active_groups)
+            if is_group_rollpig_enabled(group_id)
+        ]
+        if not enabled_active_groups:
+            logger.info("[每日总结] 今日没有启用 rollpig 的活跃群，跳过推送")
+            return
+
         group_summaries = {}
-        protected_users: set[str] = set()
-        for group_id in sorted(active_groups):
-            summary = data_manager.get_daily_summary(group_id=group_id)
+        protect_date = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        for group_id in enabled_active_groups:
+            summary = await build_daily_summary(store, group_id=group_id)
             group_summaries[group_id] = summary
             if summary.get("most_roasted_id") and summary.get("most_roasted_count", 0) >= 2:
-                protected_users.add(summary["most_roasted_id"])
-
-        if protected_users:
-            await data_manager.set_protected_users(sorted(protected_users))
+                await store.replace_group_protections(group_id, [summary["most_roasted_id"]], protect_date)
+            else:
+                await store.replace_group_protections(group_id, [], protect_date)
 
         # 清理旧事件
-        await data_manager.clean_old_events(days_to_keep=7)
-        await data_manager.clean_old_history(days_to_keep=14)
+        await store.prune_events(days_to_keep=7)
+        await store.prune_history(days_to_keep=14)
 
         try:
             bot = get_bot()
@@ -1057,13 +1225,26 @@ async def daily_summary_job():
             logger.warning("[每日总结] 无可用 Bot，跳过推送")
             return
 
-        for group_id in sorted(active_groups):
+        # ================================ 日报推送开关过滤 ================================ #
+        # “日报推送”是独立于 rollpig 主功能的第二层开关：
+        # 群内玩法可以开启，但日报消息可以单独关闭。
+        summary_push_groups = [
+            group_id for group_id in enabled_active_groups
+            if is_daily_summary_enabled(group_id)
+        ]
+        if not summary_push_groups:
+            logger.info("[每日总结] 已完成保护名单刷新，但没有群开启日报推送")
+            return
+
+        for group_id in summary_push_groups:
             try:
                 text = build_daily_summary_text(group_summaries[group_id])
                 await bot.send_group_msg(group_id=int(group_id), message=text)
             except Exception as e:
                 logger.warning(f"[每日总结] 推送失败: group={group_id} error={e}")
 
-        logger.info(f"[每日总结] 推送完成, 共 {len(active_groups)} 个群")
+        logger.info(f"[每日总结] 推送完成, 共 {len(summary_push_groups)} 个群")
+    except CloudStoreError as e:
+        logger.warning(f"[每日总结] 云端账本暂时不可用，跳过本轮推送: {e}")
     except Exception as e:
         logger.error(f"[每日总结] 任务异常: {e}")

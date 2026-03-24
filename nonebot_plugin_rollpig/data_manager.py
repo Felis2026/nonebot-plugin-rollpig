@@ -5,32 +5,10 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from nonebot import get_plugin_config
 from nonebot.log import logger
 import nonebot_plugin_localstore as store
 
-from .config import Config
-
-# ================= 冷却时间解析 =================
-
-plugin_config = get_plugin_config(Config)
-
-
-def resolve_roast_cooldown_seconds() -> int:
-    """解析普通烤群友 CD（秒），支持通过配置覆盖。"""
-    raw_hours = getattr(plugin_config, "rollpig_roast_cooldown_hours", 8.0)
-    try:
-        hours = float(raw_hours)
-    except (TypeError, ValueError):
-        logger.warning(f"rollpig_roast_cooldown_hours 配置非法: {raw_hours}，已回退到 8 小时")
-        hours = 8.0
-
-    if hours <= 0:
-        logger.warning(f"rollpig_roast_cooldown_hours 必须 > 0，当前值: {hours}，已回退到 8 小时")
-        hours = 8.0
-
-    return max(1, int(hours * 3600))
-
+from .runtime import resolve_roast_cooldown_seconds
 
 ROAST_COOLDOWN_SECONDS = resolve_roast_cooldown_seconds()
 
@@ -114,6 +92,29 @@ class PigDataManager:
                 if isinstance(val, dict) and "id" in val:
                     records[uid] = val["id"]
                     migrated = True
+
+        protected = data.get("protected", {})
+        if "date" in protected and isinstance(protected.get("users"), list):
+            protect_date = str(protected.get("date") or "")
+            users = [str(user_id) for user_id in protected.get("users", []) if user_id]
+            data["protected"] = {protect_date: {"__all__": users}} if protect_date else {}
+            migrated = True
+        else:
+            normalized_protected: dict[str, dict[str, list[str]]] = {}
+            for protect_date, group_map in protected.items():
+                if not _is_valid_date(str(protect_date)):
+                    continue
+                if not isinstance(group_map, dict):
+                    continue
+                normalized_group_map: dict[str, list[str]] = {}
+                for group_id, user_ids in group_map.items():
+                    if not isinstance(user_ids, list):
+                        continue
+                    normalized_group_map[str(group_id)] = [str(user_id) for user_id in user_ids if user_id]
+                normalized_protected[str(protect_date)] = normalized_group_map
+            if normalized_protected != protected:
+                data["protected"] = normalized_protected
+                migrated = True
         if migrated:
             logger.info("pig_data.json 数据结构已自动迁移/补全，开始落盘...")
             self.data = data
@@ -136,10 +137,14 @@ class PigDataManager:
 
     # ---- 今日/历史 抽猪记录 ----
 
-    def get_today_pig(self, user_id: str) -> Optional[str]:
+    def get_today_pig(self, user_id: str, date_str: Optional[str] = None) -> Optional[str]:
         """返回今日已抽的 pig_id，未抽返回 None。"""
-        today = datetime.date.today().isoformat()
-        return self.data["history"].get(today, {}).get(user_id)
+        target_date = date_str or datetime.date.today().isoformat()
+        return self.data["history"].get(target_date, {}).get(user_id)
+
+    def get_daily_rolls(self, date_str: Optional[str] = None) -> dict:
+        target_date = date_str or datetime.date.today().isoformat()
+        return dict(self.data.get("history", {}).get(target_date, {}))
 
     def _record_group_roll(self, date_str: str, group_id: str, user_id: str, pig_id: str):
         """在群维度登记今日已出现的猪形态，用于群内日报与随机烤群友。"""
@@ -167,13 +172,58 @@ class PigDataManager:
 
             await self._atomic_save()
 
-    async def mark_group_roll_seen(self, user_id: str, pig_id: str, group_id: str):
+    async def get_or_create_today_pig(
+        self,
+        user_id: str,
+        proposed_pig_id: str,
+        date_str: Optional[str] = None,
+        group_id: str = "",
+    ) -> tuple[str, bool]:
+        target_date = date_str or datetime.date.today().isoformat()
+        async with self._lock:
+            history = self.data.setdefault("history", {})
+            day_history = history.setdefault(target_date, {})
+            existing_pig_id = day_history.get(user_id)
+            dirty = False
+
+            if existing_pig_id:
+                if group_id:
+                    before = (
+                        self.data.get("group_rolls", {})
+                        .get(target_date, {})
+                        .get(group_id, {})
+                        .get(user_id)
+                    )
+                    self._record_group_roll(target_date, group_id, user_id, existing_pig_id)
+                    dirty = before != existing_pig_id
+                if dirty:
+                    await self._atomic_save()
+                return existing_pig_id, False
+
+            day_history[user_id] = proposed_pig_id
+            self._record_group_roll(target_date, group_id, user_id, proposed_pig_id)
+
+            collection = self.data.setdefault("collection", {})
+            user_collection = collection.setdefault(user_id, [])
+            if proposed_pig_id not in user_collection:
+                user_collection.append(proposed_pig_id)
+
+            await self._atomic_save()
+            return proposed_pig_id, True
+
+    async def mark_group_roll_seen(
+        self,
+        user_id: str,
+        pig_id: str,
+        group_id: str,
+        date_str: Optional[str] = None,
+    ):
         """将已有的今日形态登记到当前群，避免群内统计漏记。"""
         if not group_id:
             return
         async with self._lock:
-            today = datetime.date.today().isoformat()
-            self._record_group_roll(today, group_id, user_id, pig_id)
+            target_date = date_str or datetime.date.today().isoformat()
+            self._record_group_roll(target_date, group_id, user_id, pig_id)
             await self._atomic_save()
 
     def get_pig_by_date(self, user_id: str, date_str: str) -> Optional[str]:
@@ -233,6 +283,29 @@ class PigDataManager:
 
         return True, ""
 
+    async def consume_roast_usage(
+        self,
+        user_id: str,
+        now_ts: Optional[float] = None,
+        cooldown_seconds: Optional[int] = None,
+    ) -> tuple[bool, int]:
+        now = float(now_ts or time.time())
+        cooldown = cooldown_seconds or ROAST_COOLDOWN_SECONDS
+        async with self._lock:
+            usage = self.data.setdefault("usage", {})
+            if usage and isinstance(list(usage.values())[0], dict):
+                self.data["usage"] = {}
+                usage = self.data["usage"]
+
+            last_use = float(usage.get(user_id, 0) or 0)
+            remaining = max(0, int(cooldown - (now - last_use)))
+            if remaining > 0:
+                return False, remaining
+
+            usage[user_id] = now
+            await self._atomic_save()
+            return True, 0
+
     async def update_roast_usage(self, user_id: str):
         """记录本次使用时间戳。"""
         async with self._lock:
@@ -251,6 +324,16 @@ class PigDataManager:
         if "force_usage" not in self.data or not isinstance(self.data["force_usage"], dict):
             self.data["force_usage"] = {}
         return self.data["force_usage"].get(user_id) != today
+
+    async def consume_force_roast_usage(self, user_id: str, date_str: Optional[str] = None) -> bool:
+        target_date = date_str or datetime.date.today().isoformat()
+        async with self._lock:
+            usage = self.data.setdefault("force_usage", {})
+            if usage.get(user_id) == target_date:
+                return False
+            usage[user_id] = target_date
+            await self._atomic_save()
+            return True
 
     async def update_force_roast_usage(self, user_id: str):
         async with self._lock:
@@ -414,17 +497,37 @@ class PigDataManager:
 
     # ---- 被烤最多 → 次日保护 ----
 
-    def is_protected(self, user_id: str) -> bool:
-        """检查用户今日是否受保护。"""
-        today = datetime.date.today().isoformat()
-        prot = self.data.get("protected", {})
-        return prot.get("date") == today and user_id in prot.get("users", [])
+    def is_protected(self, group_id: str, user_id: str, date_str: Optional[str] = None) -> bool:
+        """检查用户在当前群今日是否受保护。"""
+        target_date = date_str or datetime.date.today().isoformat()
+        protected_map = self.data.get("protected", {}).get(target_date, {})
+        if not isinstance(protected_map, dict):
+            return False
+        group_users = protected_map.get(group_id, [])
+        legacy_users = protected_map.get("__all__", [])
+        return user_id in group_users or user_id in legacy_users
+
+    async def replace_group_protected_users(
+        self,
+        group_id: str,
+        user_ids: list[str],
+        protect_date: Optional[str] = None,
+    ):
+        """按群设置某日受保护的用户列表。"""
+        target_date = protect_date or (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        async with self._lock:
+            protected = self.data.setdefault("protected", {})
+            day_map = protected.setdefault(target_date, {})
+            day_map[group_id] = sorted({str(user_id) for user_id in user_ids if user_id})
+            await self._atomic_save()
 
     async def set_protected_users(self, user_ids: list):
-        """设置明日受保护的用户列表。"""
+        """兼容旧接口：写入 legacy 全局保护名单。"""
+        target_date = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
         async with self._lock:
-            tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
-            self.data["protected"] = {"date": tomorrow, "users": user_ids}
+            protected = self.data.setdefault("protected", {})
+            day_map = protected.setdefault(target_date, {})
+            day_map["__all__"] = sorted({str(user_id) for user_id in user_ids if user_id})
             await self._atomic_save()
 
     async def clean_old_events(self, days_to_keep: int = 7):
@@ -439,7 +542,17 @@ class PigDataManager:
             ]
             for d in dates_to_del:
                 del events[d]
-            if dates_to_del:
+
+            protected = self.data.get("protected", {})
+            protection_dates_to_del = [
+                d for d in list(protected.keys())
+                if _is_valid_date(d)
+                and (today - datetime.date.fromisoformat(d)).days > 1
+            ]
+            for d in protection_dates_to_del:
+                del protected[d]
+
+            if dates_to_del or protection_dates_to_del:
                 await self._atomic_save()
 
 
@@ -451,5 +564,11 @@ def _is_valid_date(date_str: str) -> bool:
         return False
 
 
-# 全局单例，供各指令处理函数统一使用
-data_manager = PigDataManager()
+_data_manager: PigDataManager | None = None
+
+
+def get_data_manager() -> PigDataManager:
+    global _data_manager
+    if _data_manager is None:
+        _data_manager = PigDataManager()
+    return _data_manager
