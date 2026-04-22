@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "nonebot_plugin_rollpig"
-version = "0.5.0"  # v0.5.0 release
+version = "0.5.1"  # v0.5.1 release
 description = "今天是什么小猪"
 authors = ["Bear_lele <lele2587342146@gmail.com>","Felis"]
 license = "MIT"
