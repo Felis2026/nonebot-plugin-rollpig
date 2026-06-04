@@ -26,10 +26,13 @@ from .roast_manager import roast_manager
 from .runtime import is_daily_summary_enabled, is_group_rollpig_enabled, resolve_roast_cooldown_seconds
 from .store import store
 from .store.cloud import CloudStoreError
-from .store.models import RoastEvent
+from .store.models import DailyRollResult, DrawState, RoastEvent
 from .summary_service import build_daily_summary
 from .texts import (
     TOMORROW_TEXTS,
+    DAILY_ROLL_NEW_PIG_TEXTS,
+    DAILY_ROLL_DUPLICATE_LEVEL_UP_TEXTS,
+    DAILY_ROLL_DUPLICATE_SAME_LEVEL_TEXTS,
     FOOD_PIG_IDS, HUMAN_PIG_ID, EATEN_PIG_ID,
     FORCE_ROAST_KEYWORDS, SUPER_FORCE_ROAST_KEYWORD,
     TODAY_ROAST_HUMAN_BLOCK_TEXTS, TODAY_ROAST_EATEN_BLOCK_TEXTS, TODAY_ROAST_FOOD_BLOCK_TEXTS,
@@ -70,6 +73,7 @@ __plugin_meta__ = PluginMetadata(
     今日烤猪 - 把今天的猪做成美食（人类/熟食形态会拦截）
     烤群友 - 把群友做成烤猪（目标需已抽猪且非人类/熟食）
     烤群友 + 打点后厨/偷换烤架/贿赂主厨/加急生火(兼容加急生活) - 每日一次强制成功（目标仍需已抽猪且非人类/熟食）
+    加急生火 + @目标 / 回复目标 - 直达触发一次普通后门烧烤
     烤群友 + 强行点火 - superuser 专属，无限强制成功（目标仍需已抽猪且非人类/熟食）
     
     📊 统计指令：
@@ -90,6 +94,9 @@ IMAGE_DIR = PLUGIN_DIR / "resource" / "image"
 RES_DIR = PLUGIN_DIR / "resource"
 PIGHUB_IMAGE_BASE_URL = "https://pighub.top/data/"
 PIGHUB_TTL_SECONDS = 6 * 3600  # PigHub 图库缓存有效期（6小时）
+MAX_EXPERT_LEVEL = 5
+DUPLICATE_PITY_WEIGHT_STEP = 0.5
+DUPLICATE_PITY_WEIGHT_CAP = 4.0
 
 pighub_images: list = []
 pighub_last_loaded: float = 0.0
@@ -138,6 +145,109 @@ def is_human_pig(pig_data: Optional[dict]) -> bool:
 
 def is_eaten_pig(pig_data: Optional[dict]) -> bool:
     return bool(pig_data and pig_data.get("id") == EATEN_PIG_ID)
+
+
+def get_expert_level(copies: int) -> int:
+    """根据累计抽到次数计算专家等级：1 次为 Lv.0，6 次及以上封顶 Lv.5。"""
+    return min(max(int(copies) - 1, 0), MAX_EXPERT_LEVEL)
+
+
+# ================================ P1A抽猪成长反馈 ================================ #
+# 伪保底只影响“今日小猪/自动补抽”在未创建今日记录前的候选权重。
+# 真正的 copies 与 duplicate_streak 更新仍由 store.get_or_create_daily_roll 收口，
+# 这样 cloud 模式可以交给服务端事务兜底，本地模式也能保持同一语义。
+
+async def pick_daily_roll_candidate(user_id: str) -> dict:
+    """按用户当前图鉴状态选择今日候选猪；连续重复越多，新猪权重越高。"""
+    draw_state = await store.get_draw_state(user_id)
+    owned_pig_ids = set(draw_state.pig_ids)
+    duplicate_streak = max(0, int(draw_state.duplicate_streak or 0))
+    new_pig_bonus = min(duplicate_streak * DUPLICATE_PITY_WEIGHT_STEP, DUPLICATE_PITY_WEIGHT_CAP)
+
+    weights = []
+    for pig in PIG_LIST:
+        pig_id = str(pig.get("id", ""))
+        is_unowned = pig_id and pig_id not in owned_pig_ids
+        weights.append(1.0 + new_pig_bonus if is_unowned else 1.0)
+
+    # random.choices 比手写累计权重更不容易写出边界错误；PIG_LIST 为空时调用方已拦截。
+    return random.choices(PIG_LIST, weights=weights, k=1)[0]
+
+
+def build_roll_growth_text(result: DailyRollResult, pig_data: dict) -> str:
+    """生成今日首次抽猪后的成长提示；重复查看当天结果时不刷提示也不刷等级。"""
+    if not result.created:
+        return ""
+
+    pig_name = pig_data.get("name", "未知小猪")
+    current_level = get_expert_level(result.copies)
+    if result.is_new_pig:
+        return random.choice(DAILY_ROLL_NEW_PIG_TEXTS).format(pig=pig_name, level=current_level)
+
+    previous_level = get_expert_level(result.previous_copies)
+    if previous_level != current_level:
+        return random.choice(DAILY_ROLL_DUPLICATE_LEVEL_UP_TEXTS).format(
+            pig=pig_name,
+            old_level=previous_level,
+            new_level=current_level,
+        )
+    return random.choice(DAILY_ROLL_DUPLICATE_SAME_LEVEL_TEXTS).format(pig=pig_name, level=current_level)
+
+
+def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pigs: int) -> str:
+    """生成 P1A 版猪圈摘要；完整图鉴图片留到后续 P1.5。"""
+    user_count = len(draw_state.pig_ids)
+    percent = int((user_count / total_pigs) * 100) if total_pigs > 0 else 0
+
+    ranked_progress = sorted(
+        draw_state.progress.items(),
+        key=lambda item: (-item[1].copies, item[1].first_obtained_at or "", item[0]),
+    )
+    favorite_line = "🐷 本命猪：暂无"
+    top_repeat_line = "⭐ 高等级小猪：暂无重复猪，猪圈还很清新"
+    max_level = 0
+    maxed_count = 0
+    if ranked_progress:
+        levels = [get_expert_level(progress.copies) for _, progress in ranked_progress]
+        max_level = max(levels)
+        maxed_count = sum(1 for level in levels if level >= MAX_EXPERT_LEVEL)
+
+        favorite_id, favorite_progress = ranked_progress[0]
+        favorite = get_pig_by_id(favorite_id)
+        favorite_name = favorite.get("name", favorite_id) if favorite else favorite_id
+        favorite_level = get_expert_level(favorite_progress.copies)
+        favorite_line = f"🐷 本命猪：【{favorite_name}】专家等级 EX Lv. {favorite_level}（累计 {favorite_progress.copies} 次）"
+
+        repeat_items = [
+            (pig_id, progress)
+            for pig_id, progress in ranked_progress
+            if progress.copies >= 2
+        ][:5]
+        if repeat_items:
+            parts = []
+            for pig_id, progress in repeat_items:
+                pig = get_pig_by_id(pig_id)
+                pig_name = pig.get("name", pig_id) if pig else pig_id
+                parts.append(f"【{pig_name}】EX Lv.{get_expert_level(progress.copies)}×{progress.copies}")
+            top_repeat_line = "⭐ 高等级小猪：" + "、".join(parts)
+
+    if draw_state.duplicate_streak > 0:
+        streak_line = f"🔥 连续重复：{draw_state.duplicate_streak} 次（新猪气息正在靠近）"
+    else:
+        streak_line = "🔥 连续重复：0 次（下一只从平常心开始）"
+
+    return (
+        f"【我的猪圈统计】\n"
+        f"👑 猪圈主人：{user_name}\n"
+        f"📦 已收集：{user_count} / {total_pigs} 只\n"
+        f"📈 收藏率：{percent}%\n"
+        f"🏅 最高等级：EX Lv. {max_level}｜满级 {maxed_count} 只\n"
+        f"{favorite_line}\n"
+        f"{top_repeat_line}\n"
+        f"{streak_line}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"完整图鉴图还在施工，先把成长进度记牢。"
+    )
 
 
 def is_superuser_user(user_id: str) -> bool:
@@ -416,22 +526,24 @@ async def _(event: Event):
     group_id = get_event_group_id(event)
     pig_id = await store.get_daily_roll(user_id)
     pig = get_pig_by_id(pig_id)
+    extra_text = ""
 
     if not pig:
         if not PIG_LIST:
             await cmd_today.finish("猪圈塌房了（数据缺失）")
             return
-        proposed_pig = random.choice(PIG_LIST)
-        resolved_pig_id, _ = await store.get_or_create_daily_roll(
+        proposed_pig = await pick_daily_roll_candidate(user_id)
+        roll_result = await store.get_or_create_daily_roll(
             user_id,
             proposed_pig["id"],
             group_id=group_id,
         )
-        pig = get_pig_by_id(resolved_pig_id) or proposed_pig
+        pig = get_pig_by_id(roll_result.pig_id) or proposed_pig
+        extra_text = build_roll_growth_text(roll_result, pig)
     elif group_id:
         await store.mark_group_roll_seen(user_id, pig["id"], group_id)
 
-    await send_rendered_pig(cmd_today, event, pig)
+    await send_rendered_pig(cmd_today, event, pig, extra_text=extra_text)
 
 
 # 2. 随机小猪
@@ -593,13 +705,13 @@ async def _(event: Event):
         if not PIG_LIST:
             await cmd_roast.finish(MessageSegment.reply(event.message_id) + "猪圈埋房了（数据缺失）")
             return
-        proposed_pig = random.choice(PIG_LIST)
-        resolved_pig_id, _ = await store.get_or_create_daily_roll(
+        proposed_pig = await pick_daily_roll_candidate(user_id)
+        roll_result = await store.get_or_create_daily_roll(
             user_id,
             proposed_pig["id"],
             group_id=group_id,
         )
-        original_pig = get_pig_by_id(resolved_pig_id) or proposed_pig
+        original_pig = get_pig_by_id(roll_result.pig_id) or proposed_pig
         auto_roll_hint = random.choice(AUTO_ROLL_ROAST_TEXTS).format(name=original_pig["name"]) + "\n"
     elif group_id:
         await store.mark_group_roll_seen(user_id, original_pig["id"], group_id)
@@ -651,7 +763,9 @@ async def _(event: Event):
 
 
 # 5.5 烤群友
-cmd_roast_member = on_command("烤群友", block=True)
+# `加急生火` 是日常使用频率最高的后门口令，因此额外开放为直达触发命令。
+# 旧写法 `烤群友 加急生火 @某人` 保持兼容；这里只是让高频输入更顺手。
+cmd_roast_member = on_command("烤群友", aliases={"加急生火"}, block=True)
 
 @cmd_roast_member.handle()
 @guard_group_enabled(cmd_roast_member)
@@ -1112,9 +1226,9 @@ cmd_sty = on_command("我的猪圈", aliases={"我的小猪"}, block=True)
 @guard_store_errors(cmd_sty)
 async def _(event: Event):
     user_id = str(event.user_id)
-    collection = await store.get_user_collection(user_id)
+    draw_state = await store.get_draw_state(user_id)
     total_pigs = len(PIG_LIST)
-    user_count = len(collection)
+    user_count = len(draw_state.pig_ids)
 
     if total_pigs <= 0:
         await cmd_sty.finish(MessageSegment.reply(event.message_id) + "猪图鉴为空，请先检查资源文件。")
@@ -1124,14 +1238,10 @@ async def _(event: Event):
         await cmd_sty.finish(MessageSegment.reply(event.message_id) + "你的猪圈空空如也！")
         return
 
-    percent = int((user_count / total_pigs) * 100)
-    msg = (
-        f"【我的猪圈统计】\n"
-        f"👑 猪圈主人：{event.sender.card or event.sender.nickname}\n"
-        f"📦 已收集：{user_count} / {total_pigs} 只\n"
-        f"📈 收藏率：{percent}%\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"继续加油，争取成为猪王！"
+    msg = build_pigsty_growth_summary(
+        event.sender.card or event.sender.nickname,
+        draw_state,
+        total_pigs,
     )
     await cmd_sty.finish(MessageSegment.reply(event.message_id) + msg)
 

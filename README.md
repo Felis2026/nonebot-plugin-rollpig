@@ -19,7 +19,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.5.1"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6.0"
 
 ```
 
@@ -34,6 +34,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.5
 * 每个用户每天只能抽取一次 🐽
 * 重复抽取不会改变结果 🐷
 * 按日期自然重置（跨天后可重新抽取）🐖
+* 重复抽到已解锁小猪会提升专家等级（EX Lv.），连续重复时下一次抽到新猪的概率会逐步提高
 
 **随机小猪** - 从 PigHub 随机获取一张猪猪图 🐖
 
@@ -65,7 +66,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.5
 * 后门仅绕过 CD 与概率判定，不绕过目标资格（目标仍需已抽猪，且不能是 **人类** / **熟食形态** / **吃掉了**）
 * 指令示例：`烤群友 加急生火 @某人` / 回复目标后发送 `烤群友 强行点火`
 
-**我的猪圈** - 查看解锁进度 📊
+**我的猪圈** - 查看解锁进度与专家等级摘要 📊
 
 **本周小猪** - 生成本周猪猪总结长图 🖼️
 
@@ -119,7 +120,7 @@ ROLLPIG_CLOUD_STRICT_MODE=true
 * 后续可能会继续扩展为“云端同步文案库”模式；当前版本仍以本地模板 / AI 生成两种方式为主
 * `ROLLPIG_ROAST_COOLDOWN_HOURS` 仅影响普通模式；后门模式不会改写普通 CD 时间戳
 * 未配置云端时，插件默认继续使用本地 `pig_data.json` 存储，不影响单 Bot 正常运行
-* `ROLLPIG_STORAGE_BACKEND=cloud` 时，`今日小猪`、`普通 CD`、`后门次数` 将在多 Bot 间同步；日报与保护按群聚合/生效
+* `ROLLPIG_STORAGE_BACKEND=cloud` 时，`今日小猪`、图鉴成长状态、普通 CD、后门次数将在多 Bot 间同步；日报与保护按群聚合/生效
 * `ROLLPIG_CLOUD_TIMEOUT` 与 `ROLLPIG_CLOUD_STRICT_MODE` 一般保持默认即可，只有明确需要调试云端行为时再调整
 * `ROLLPIG_CLOUD_STRICT_MODE=false` 的含义是：读接口可使用安全兜底值；关键写接口不会偷偷回退本地，而是向用户提示“稍后再试”，避免多 Bot 数据脑裂
 * 未接入外部控制台时，群功能与日报默认开启；宿主项目可按需接管开关
@@ -185,6 +186,26 @@ nonebot_plugin_rollpig/
 * 新增小猪时只需在 `pig.json` 添加对象，并将对应图片放到 `image/` 文件夹即可 🐷
 * 图片自动按 id 匹配，无需在 JSON 中写图片后缀 🐖
 
+
+## v0.6.0 更新日志
+
+### ✨ 新功能
+- **抽猪伪保底**：连续抽到重复猪后，下一次抽到未解锁新猪的权重会逐步提高；抽到新猪后计数清零
+- **专家等级（EX Lv.）**：每只猪记录累计抽到次数，`1~6+` 次对应 `EX Lv.0~5`
+- **成长提示**：`今日小猪` 首次抽取会根据新猪 / 重复升级 / 重复未升级随机展示短提示文案
+- **猪圈成长摘要**：`我的猪圈` 增加最高 EX Lv.、满级数量、本命猪、高等级小猪与连续重复次数展示
+
+### ☁️ 云端同步
+- 接入 rollpig-cloud 的 `draw-state` 状态读取流程，支持多 Bot 同步 `copies` 与 `duplicate_streak`
+- `get-or-create` 仅在当天首次创建抽猪记录时更新成长状态，避免重复发送命令刷等级
+- 本地 JSON 模式同步兼容新字段，未接入云端的部署仍可正常使用
+
+### 🧩 体验优化
+- `加急生火` 支持作为独立命令直达触发烤群友后门模式
+- 抽猪成长提示扩充为 3 组文案池，每组 10 条，降低重复感
+- 完整图鉴图片、卡图 EX Lv. 贴图与烧烤概率修正暂缓到后续版本
+
+---
 
 ## v0.5.1 更新日志
 
