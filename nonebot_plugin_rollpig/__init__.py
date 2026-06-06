@@ -1,4 +1,4 @@
-import json
+﻿import asyncio
 import random
 import datetime
 import time
@@ -7,7 +7,7 @@ import httpx
 from pathlib import Path
 from typing import Optional
 
-from nonebot import on_command, require, get_driver, get_bot
+from nonebot import on_command, require, get_driver, get_bot, get_plugin_config
 from nonebot.adapters.onebot.v11 import Event, MessageSegment, Message, GroupMessageEvent, Bot
 from nonebot.params import CommandArg
 from nonebot.log import logger
@@ -23,6 +23,7 @@ from nonebot_plugin_htmlrender import template_to_pic
 # 本地模块（在 require() 之后 import）
 from .config import Config
 from .roast_manager import roast_manager
+from .resource_manager import pig_resource_manager
 from .runtime import is_daily_summary_enabled, is_group_rollpig_enabled, resolve_roast_cooldown_seconds
 from .store import store
 from .store.cloud import CloudStoreError
@@ -89,8 +90,6 @@ __plugin_meta__ = PluginMetadata(
 # ================= 资源路径 =================
 
 PLUGIN_DIR = Path(__file__).parent
-PIGINFO_PATH = PLUGIN_DIR / "resource" / "pig.json"
-IMAGE_DIR = PLUGIN_DIR / "resource" / "image"
 RES_DIR = PLUGIN_DIR / "resource"
 PIGHUB_IMAGE_BASE_URL = "https://pighub.top/data/"
 PIGHUB_TTL_SECONDS = 6 * 3600  # PigHub 图库缓存有效期（6小时）
@@ -103,27 +102,22 @@ pighub_last_loaded: float = 0.0
 
 # ================= 资源加载 =================
 
-def load_resource_json(path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text("utf-8"))
-    except Exception as e:
-        logger.error(f"资源文件读取失败: {path} error={e}")
-        return default
+PIG_LIST: list[dict] = []
 
 
-PIG_LIST = load_resource_json(PIGINFO_PATH, [])
+def reload_rollpig_resources() -> None:
+    """刷新内存中的小猪资源快照；云端资源坏掉时由资源管理器自动回退到内置资源。"""
+    global PIG_LIST
+    pig_resource_manager.reload()
+    PIG_LIST = pig_resource_manager.pig_list
+
+
+reload_rollpig_resources()
 
 # ================= 工具函数 =================
 
 def find_image_file(pig_id: str) -> Path | None:
-    exts = ["png", "jpg", "jpeg", "webp", "gif"]
-    for ext in exts:
-        file = IMAGE_DIR / f"{pig_id}.{ext}"
-        if file.exists():
-            return file
-    return None
+    return pig_resource_manager.find_image_file(pig_id)
 
 
 def get_pig_by_id(pig_id: Optional[str]) -> Optional[dict]:
@@ -136,15 +130,30 @@ def get_pig_by_id(pig_id: Optional[str]) -> Optional[dict]:
 
 
 def is_food_pig(pig_data: Optional[dict]) -> bool:
-    return bool(pig_data and pig_data.get("id") in FOOD_PIG_IDS)
+    return bool(pig_data and pig_data.get("id") in get_food_pig_ids())
+
+
+def get_food_pig_ids() -> list[str]:
+    """合并内置熟食列表与云端 pig_rules.json；远端缺失时仍保持旧逻辑。"""
+    return list(dict.fromkeys([*FOOD_PIG_IDS, *sorted(pig_resource_manager.food_pig_ids)]))
+
+
+def get_human_pig_ids() -> list[str]:
+    """合并内置人类形态与云端规则，允许后续资源包扩展同类特殊形态。"""
+    return list(dict.fromkeys([HUMAN_PIG_ID, *sorted(pig_resource_manager.human_pig_ids)]))
 
 
 def is_human_pig(pig_data: Optional[dict]) -> bool:
-    return bool(pig_data and pig_data.get("id") == HUMAN_PIG_ID)
+    return bool(pig_data and pig_data.get("id") in get_human_pig_ids())
+
+
+def get_eaten_pig_ids() -> list[str]:
+    """合并内置“吃掉了”形态与云端规则，避免特殊终态被新增资源绕过。"""
+    return list(dict.fromkeys([EATEN_PIG_ID, *sorted(pig_resource_manager.eaten_pig_ids)]))
 
 
 def is_eaten_pig(pig_data: Optional[dict]) -> bool:
-    return bool(pig_data and pig_data.get("id") == EATEN_PIG_ID)
+    return bool(pig_data and pig_data.get("id") in get_eaten_pig_ids())
 
 
 def get_expert_level(copies: int) -> int:
@@ -513,7 +522,43 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
     msg += MessageSegment.image(pic)
     await matcher.finish(msg)
 
+
+async def sync_rollpig_resources(force: bool = False) -> str:
+    """同步云端小猪资源；成功后立即刷新内存快照，失败时保留当前资源继续运行。"""
+    result = await pig_resource_manager.sync_from_remote(force=force)
+    if result.updated:
+        reload_rollpig_resources()
+        return f"小猪资源同步完成：{result.resource_version}"
+    if result.skipped:
+        return result.message or "小猪资源无需同步"
+    return result.message or "小猪资源同步完成"
+
+
 # ================= 指令处理区域 =================
+
+# 0. 小猪资源同步（管理员）
+cmd_sync_resources = on_command("同步小猪资源", aliases={"刷新小猪图鉴"}, block=True)
+
+
+@cmd_sync_resources.handle()
+async def _(event: Event):
+    user_id = str(event.user_id)
+    if not is_superuser_user(user_id):
+        await cmd_sync_resources.finish(MessageSegment.reply(event.message_id) + "只有超级用户可以同步小猪资源。")
+        return
+
+    try:
+        message = await sync_rollpig_resources(force=True)
+    except Exception as error:
+        logger.error(f"rollpig 小猪资源手动同步失败: {error}")
+        await cmd_sync_resources.finish(MessageSegment.reply(event.message_id) + f"小猪资源同步失败：{error}")
+        return
+
+    await cmd_sync_resources.finish(
+        MessageSegment.reply(event.message_id)
+        + f"{message}\n当前资源版本：{pig_resource_manager.resource_version}｜小猪数量：{len(PIG_LIST)}"
+    )
+
 
 # 1. 今日小猪
 cmd_today = on_command("今天是什么小猪", aliases={"今日小猪"}, block=True)
@@ -737,7 +782,7 @@ async def _(event: Event):
         )
         return
 
-    food_id = random.choice(FOOD_PIG_IDS)
+    food_id = random.choice(get_food_pig_ids())
     food_pig_template = get_pig_by_id(food_id)
     if not food_pig_template:
         await cmd_roast.finish("食材配置缺失，请检查 pig.json。")
@@ -822,7 +867,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # 检测目标是否是 Bot 自身 → 特殊反噬，不消耗 CD，纯文本回复
     if target_id == str(event.self_id):
-        food_id = random.choice(FOOD_PIG_IDS)
+        food_id = random.choice(get_food_pig_ids())
         food_pig = get_pig_by_id(food_id)
         food_name = food_pig["name"] if food_pig else "美食"
         bot_text = random.choice(ROAST_BOT_TEXTS).format(attacker=attacker_name, food=food_name)
@@ -903,7 +948,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # --- 后门模式：必定成功 ---
     if force_mode in {"normal", "super"}:
-        food_id = random.choice(FOOD_PIG_IDS)
+        food_id = random.choice(get_food_pig_ids())
         food_pig_template = get_pig_by_id(food_id)
         if not food_pig_template:
             await cmd_roast_member.finish("食材配置缺失，请联系管理员修复 pig.json。")
@@ -940,7 +985,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # === 成功 (60%) ===
     if roll <= 60:
-        food_id = random.choice(FOOD_PIG_IDS)
+        food_id = random.choice(get_food_pig_ids())
         food_pig_template = get_pig_by_id(food_id)
         if not food_pig_template:
             await cmd_roast_member.finish("食材配置缺失，请联系管理员修复 pig.json。")
@@ -990,7 +1035,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
     # === 反噬 (10%) ===
     else:
         if attacker_pig and (not is_food_pig(attacker_pig)) and (not is_human_pig(attacker_pig)):
-            food_id = random.choice(FOOD_PIG_IDS)
+            food_id = random.choice(get_food_pig_ids())
             food_pig_template = get_pig_by_id(food_id)
             if not food_pig_template:
                 await cmd_roast_member.finish("食材配置缺失，请联系管理员修复 pig.json。")
@@ -1122,7 +1167,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # 成功 (60%)
     if roll <= 60:
-        food_id = random.choice(FOOD_PIG_IDS)
+        food_id = random.choice(get_food_pig_ids())
         food_pig_template = get_pig_by_id(food_id)
         if not food_pig_template:
             await cmd_random_roast.finish("食材配置缺失，请联系管理员修复 pig.json。")
@@ -1172,7 +1217,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
     # 反噬 (10%)
     else:
         if attacker_pig and (not is_food_pig(attacker_pig)) and (not is_human_pig(attacker_pig)):
-            food_id = random.choice(FOOD_PIG_IDS)
+            food_id = random.choice(get_food_pig_ids())
             food_pig_template = get_pig_by_id(food_id)
             if not food_pig_template:
                 await cmd_random_roast.finish("食材配置缺失。")
@@ -1307,6 +1352,43 @@ async def _(event: Event):
 
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
+
+
+def get_resource_sync_interval_hours() -> int:
+    """读取资源同步间隔；配置异常时回退 24 小时，避免定时任务注册失败。"""
+    try:
+        config = get_plugin_config(Config)
+        return max(1, int(config.rollpig_resource_sync_interval_hours or 24))
+    except Exception as error:
+        logger.warning(f"rollpig_resource_sync_interval_hours 配置非法，已回退到 24 小时: {error}")
+        return 24
+
+
+async def run_background_resource_sync(source: str) -> None:
+    """后台同步云端小猪资源；任何异常都只记日志，不能影响主业务。"""
+    try:
+        message = await sync_rollpig_resources(force=False)
+        logger.info(f"[小猪资源同步] {source}: {message}")
+    except Exception as error:
+        logger.warning(f"[小猪资源同步] {source} 失败，继续使用当前资源: {error}")
+
+
+@get_driver().on_startup
+async def startup_resource_sync():
+    """启动后异步检查一次资源包；不阻塞 NoneBot 启动和连接。"""
+    config = get_plugin_config(Config)
+    if not config.rollpig_resource_sync_enabled:
+        return
+    asyncio.create_task(run_background_resource_sync("startup"))
+
+
+@scheduler.scheduled_job("interval", hours=get_resource_sync_interval_hours(), id="rollpig_resource_sync", max_instances=1)
+async def resource_sync_job():
+    """低频检查云端资源包，减少多实例手动同步新猪素材的运维成本。"""
+    config = get_plugin_config(Config)
+    if not config.rollpig_resource_sync_enabled:
+        return
+    await run_background_resource_sync("interval")
 
 
 def build_daily_summary_text(summary: dict) -> str:

@@ -14,5 +14,13 @@ class Config(BaseModel):
     rollpig_cloud_timeout: float = 3.0
     rollpig_cloud_strict_mode: bool = True  # true=云端异常直接失败；false=读接口可安全兜底，写接口仍提示稍后重试
 
+    # --- 小猪资源云端同步 ---
+    # 默认指向 FelisLab 静态资源包；同步失败时只回退到本地缓存/插件内置资源，不影响 Bot 启动。
+    rollpig_resource_sync_enabled: bool = True
+    rollpig_resource_manifest_url: str = "https://pig.felislab.cc/resources/rollpig/manifest.json"
+    rollpig_resource_sync_interval_hours: int = 24
+    rollpig_resource_sync_timeout: float = 10.0
+    rollpig_resource_max_file_size: int = 10 * 1024 * 1024
+
     # --- 代理设置 (可选，如果服务器在国内连不上API) ---
     rollpig_proxy: Optional[str] = None

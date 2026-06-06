@@ -19,7 +19,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6.0"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6.1"
 
 ```
 
@@ -111,6 +111,12 @@ ROLLPIG_CLOUD_TIMEOUT=3.0
 # (可选) 云端请求严格模式，默认 true
 ROLLPIG_CLOUD_STRICT_MODE=true
 
+# (可选) 小猪资源云端同步，默认启用并指向 FelisLab 资源包
+ROLLPIG_RESOURCE_SYNC_ENABLED=true
+ROLLPIG_RESOURCE_MANIFEST_URL=https://pig.felislab.cc/resources/rollpig/manifest.json
+ROLLPIG_RESOURCE_SYNC_INTERVAL_HOURS=24
+ROLLPIG_RESOURCE_SYNC_TIMEOUT=10.0
+
 ```
 
 说明：
@@ -123,6 +129,8 @@ ROLLPIG_CLOUD_STRICT_MODE=true
 * `ROLLPIG_STORAGE_BACKEND=cloud` 时，`今日小猪`、图鉴成长状态、普通 CD、后门次数将在多 Bot 间同步；日报与保护按群聚合/生效
 * `ROLLPIG_CLOUD_TIMEOUT` 与 `ROLLPIG_CLOUD_STRICT_MODE` 一般保持默认即可，只有明确需要调试云端行为时再调整
 * `ROLLPIG_CLOUD_STRICT_MODE=false` 的含义是：读接口可使用安全兜底值；关键写接口不会偷偷回退本地，而是向用户提示“稍后再试”，避免多 Bot 数据脑裂
+* `ROLLPIG_RESOURCE_SYNC_ENABLED=true` 时，插件会从云端同步 `pig.json`、图片和可选规则文件到本地缓存；同步失败会继续使用旧缓存或插件内置资源
+* 超级用户可发送 `同步小猪资源` / `刷新小猪图鉴` 手动触发资源同步
 * 未接入外部控制台时，群功能与日报默认开启；宿主项目可按需接管开关
 
 ---
@@ -153,6 +161,8 @@ nonebot_plugin_rollpig/resource
 * **image/** 小猪图片
 * 图片命名需和信息中的 `id` 一致
 * 支持图片类型：`["png", "jpg", "jpeg", "webp", "gif"]`
+* **pig_rules.json** 可选规则文件，用于维护熟食等特殊分类，避免污染上游兼容的 `pig.json` 基础格式
+* 云端同步资源会缓存到本地 `data/localstore/nonebot_plugin_rollpig/resources/`，优先级高于插件内置资源；删除缓存后会自动回退到内置资源
 
 
 
@@ -164,6 +174,7 @@ nonebot_plugin_rollpig/resource
 nonebot_plugin_rollpig/
 ├─ __init__.py
 ├─ config.py           # 配置模型
+├─ resource_manager.py # 云端小猪资源同步与本地缓存加载
 ├─ data_manager.py     # 本地 JSON 存储实现
 ├─ roast_manager.py    # AI 烤猪与文案生成
 ├─ runtime.py          # 宿主适配 / 群开关 / 运行时工具
@@ -175,6 +186,7 @@ nonebot_plugin_rollpig/
 │   └─ cloud.py        # rollpig-cloud 云端适配
 ├─ resource/
 │   ├─ pig.json
+│   ├─ pig_rules.json
 │   └─ image/
 │       └─ pig.png
 ```
@@ -186,6 +198,19 @@ nonebot_plugin_rollpig/
 * 新增小猪时只需在 `pig.json` 添加对象，并将对应图片放到 `image/` 文件夹即可 🐷
 * 图片自动按 id 匹配，无需在 JSON 中写图片后缀 🐖
 
+
+## v0.6.1 更新日志
+
+### ☁️ 云端资源同步
+- 新增云端小猪资源包同步，支持从 `manifest.json` 拉取 `pig.json`、`pig_rules.json` 与图片资源
+- 同步后的资源会落到本地缓存目录，运行时优先使用缓存，云端异常时回退插件内置资源
+- 新增超管命令 `同步小猪资源` / `刷新小猪图鉴`，可手动触发资源刷新
+
+### 🧩 规则兼容
+- 新增 `pig_rules.json`，将熟食、人类、吃掉了等特殊形态从基础 `pig.json` 拆出
+- 烤猪判定合并内置规则与云端规则，避免新增特殊形态绕过拦截
+
+---
 
 ## v0.6.0 更新日志
 
