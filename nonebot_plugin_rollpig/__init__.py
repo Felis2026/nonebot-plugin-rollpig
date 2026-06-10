@@ -34,11 +34,11 @@ from .texts import (
     DAILY_ROLL_NEW_PIG_TEXTS,
     DAILY_ROLL_DUPLICATE_LEVEL_UP_TEXTS,
     DAILY_ROLL_DUPLICATE_SAME_LEVEL_TEXTS,
-    FOOD_PIG_IDS, HUMAN_PIG_ID, EATEN_PIG_ID,
+    FOOD_PIG_IDS, HUMAN_PIG_ID, EATEN_PIG_ID, SOLD_PIG_ID,
     FORCE_ROAST_KEYWORDS, SUPER_FORCE_ROAST_KEYWORD,
-    TODAY_ROAST_HUMAN_BLOCK_TEXTS, TODAY_ROAST_EATEN_BLOCK_TEXTS, TODAY_ROAST_FOOD_BLOCK_TEXTS,
-    TARGET_HUMAN_BLOCK_TEXTS, TARGET_EATEN_BLOCK_TEXTS, TARGET_FOOD_BLOCK_TEXTS,
-    BACKFIRE_HUMAN_TEXTS, BACKFIRE_EATEN_TEXTS, BACKFIRE_FOOD_TEXTS,
+    TODAY_ROAST_HUMAN_BLOCK_TEXTS, TODAY_ROAST_EATEN_BLOCK_TEXTS, TODAY_ROAST_SOLD_BLOCK_TEXTS, TODAY_ROAST_FOOD_BLOCK_TEXTS,
+    TARGET_HUMAN_BLOCK_TEXTS, TARGET_EATEN_BLOCK_TEXTS, TARGET_SOLD_BLOCK_TEXTS, TARGET_FOOD_BLOCK_TEXTS,
+    BACKFIRE_HUMAN_TEXTS, BACKFIRE_EATEN_TEXTS, BACKFIRE_SOLD_TEXTS, BACKFIRE_FOOD_TEXTS,
     BACKFIRE_NO_PIG_TEXTS, BACKFIRE_GENERIC_TEXTS,
     ESCAPE_TEXTS,
     SUPER_FORCE_ROAST_PREFIX_TEXTS, FORCE_ROAST_PREFIX_TEXTS,
@@ -154,6 +154,26 @@ def get_eaten_pig_ids() -> list[str]:
 
 def is_eaten_pig(pig_data: Optional[dict]) -> bool:
     return bool(pig_data and pig_data.get("id") in get_eaten_pig_ids())
+
+
+def get_sold_pig_ids() -> list[str]:
+    """合并内置“卖掉了”形态与云端规则，让售罄类特殊形态走独立拦截文案。"""
+    return list(dict.fromkeys([SOLD_PIG_ID, *sorted(pig_resource_manager.sold_pig_ids)]))
+
+
+def is_sold_pig(pig_data: Optional[dict]) -> bool:
+    return bool(pig_data and pig_data.get("id") in get_sold_pig_ids())
+
+
+def can_backfire_roast(attacker_pig: Optional[dict]) -> bool:
+    """判断反噬时攻击者是否还能被做成食物；特殊终态只走文字反噬，不二次加工。"""
+    return bool(
+        attacker_pig
+        and not is_food_pig(attacker_pig)
+        and not is_human_pig(attacker_pig)
+        and not is_eaten_pig(attacker_pig)
+        and not is_sold_pig(attacker_pig)
+    )
 
 
 def get_expert_level(copies: int) -> int:
@@ -288,6 +308,9 @@ def pick_backfire_text(attacker_name: str, target_name: str, attacker_pig: Optio
     elif is_eaten_pig(attacker_pig):
         pool = BACKFIRE_EATEN_TEXTS
         shape = "吃掉了"
+    elif is_sold_pig(attacker_pig):
+        pool = BACKFIRE_SOLD_TEXTS
+        shape = "卖掉了"
     elif is_food_pig(attacker_pig):
         pool = BACKFIRE_FOOD_TEXTS
         shape = attacker_pig.get("name", "熟食")
@@ -524,14 +547,18 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
 
 
 async def sync_rollpig_resources(force: bool = False) -> str:
-    """同步云端小猪资源；成功后立即刷新内存快照，失败时保留当前资源继续运行。"""
-    result = await pig_resource_manager.sync_from_remote(force=force)
-    if result.updated:
+    """同步公有云端资源与可选私有 overlay；成功后立即刷新内存快照。"""
+    public_result = await pig_resource_manager.sync_from_remote(force=force)
+    private_result = await pig_resource_manager.sync_private_from_remote(force=force)
+
+    if public_result.updated or private_result.updated:
         reload_rollpig_resources()
-        return f"小猪资源同步完成：{result.resource_version}"
-    if result.skipped:
-        return result.message or "小猪资源无需同步"
-    return result.message or "小猪资源同步完成"
+
+    messages = []
+    for result in (public_result, private_result):
+        if result.message:
+            messages.append(result.message)
+    return "；".join(messages) or "小猪资源无需同步"
 
 
 # ================= 指令处理区域 =================
@@ -775,6 +802,13 @@ async def _(event: Event):
         )
         return
 
+    if is_sold_pig(original_pig):
+        await cmd_roast.finish(
+            MessageSegment.reply(event.message_id)
+            + random.choice(TODAY_ROAST_SOLD_BLOCK_TEXTS)
+        )
+        return
+
     if is_food_pig(original_pig):
         await cmd_roast.finish(
             MessageSegment.reply(event.message_id)
@@ -919,6 +953,13 @@ async def _(bot: Bot, event: GroupMessageEvent):
         )
         return
 
+    if is_sold_pig(target_pig):
+        await cmd_roast_member.finish(
+            MessageSegment.reply(event.message_id)
+            + random.choice(TARGET_SOLD_BLOCK_TEXTS).format(target=target_name)
+        )
+        return
+
     if is_food_pig(target_pig):
         await cmd_roast_member.finish(
             MessageSegment.reply(event.message_id)
@@ -1034,7 +1075,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # === 反噬 (10%) ===
     else:
-        if attacker_pig and (not is_food_pig(attacker_pig)) and (not is_human_pig(attacker_pig)):
+        if can_backfire_roast(attacker_pig):
             food_id = random.choice(get_food_pig_ids())
             food_pig_template = get_pig_by_id(food_id)
             if not food_pig_template:
@@ -1154,6 +1195,20 @@ async def _(bot: Bot, event: GroupMessageEvent):
         )
         return
 
+    if is_eaten_pig(target_pig):
+        await cmd_random_roast.finish(
+            MessageSegment.reply(event.message_id)
+            + random.choice(TARGET_EATEN_BLOCK_TEXTS).format(target=target_name)
+        )
+        return
+
+    if is_sold_pig(target_pig):
+        await cmd_random_roast.finish(
+            MessageSegment.reply(event.message_id)
+            + random.choice(TARGET_SOLD_BLOCK_TEXTS).format(target=target_name)
+        )
+        return
+
     if is_food_pig(target_pig):
         await cmd_random_roast.finish(
             MessageSegment.reply(event.message_id)
@@ -1216,7 +1271,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     # 反噬 (10%)
     else:
-        if attacker_pig and (not is_food_pig(attacker_pig)) and (not is_human_pig(attacker_pig)):
+        if can_backfire_roast(attacker_pig):
             food_id = random.choice(get_food_pig_ids())
             food_pig_template = get_pig_by_id(food_id)
             if not food_pig_template:

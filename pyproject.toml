@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "nonebot_plugin_rollpig"
-version = "0.6.1"  # v0.6.1 release
+version = "0.6.2"  # v0.6.2 release
 description = "今天是什么小猪"
 authors = ["Bear_lele <lele2587342146@gmail.com>","Felis"]
 license = "MIT"
@@ -8,7 +8,7 @@ readme = "README.md"
 homepage = "https://github.com/Felis2026/nonebot-plugin-rollpig"
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = ">=3.10,<4.0"
 nonebot2 = ">=2.4.0"
 nonebot-adapter-onebot = ">=2.4.0"
 nonebot-plugin-htmlrender = ">=0.6.0"
@@ -18,8 +18,11 @@ pydantic = ">=1.10.0,<3.0.0"
 # 用于替代 requests
 httpx = ">=0.20.0"
 
-# 用于本周小猪的长图合成
-Pillow = ">=9.0.0"
+# 用于本周小猪的长图合成；12.2.0 修复多组图片解析漏洞，且要求 Python >=3.10。
+Pillow = ">=12.2.0"
+
+# NoneBot 会间接依赖 python-dotenv；这里显式收紧下限以避开 1.2.2 前的符号链接覆盖漏洞。
+python-dotenv = ">=1.2.2,<2.0.0"
 
 # 用于每日总结定时推送
 nonebot-plugin-apscheduler = ">=0.5.0"

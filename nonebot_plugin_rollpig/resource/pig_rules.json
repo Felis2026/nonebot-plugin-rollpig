@@ -18,5 +18,6 @@
   "eaten_pigs": [
     "eaten"
   ],
-  "roast_excluded_pigs": []
+  "roast_excluded_pigs": [],
+  "sold_pigs": []
 }

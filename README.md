@@ -9,6 +9,8 @@
 
 ### 🐖 食用方法 🐖
 
+环境要求：Python `>=3.10`
+
 使用 pip 安装：
 
 ```bash
@@ -19,7 +21,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6.1"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6.2"
 
 ```
 
@@ -53,17 +55,17 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6
 **今日烤猪** - 把今天的猪做成美食（慎用！）🔥
 
 * 支持 **AI 生成**：开启开关且配置 Key 后，会根据猪猪类型生成“烤后感言”
-* 若你今天是 **人类**、**熟食形态**（如烤猪/培根/猪排/猪肉串/烤乳猪/猪堡包/猪油）或 **吃掉了**，会被拦截，不再继续烧烤
+* 若你今天是 **人类**、**熟食形态**（如烤猪/培根/猪排/猪肉串/烤乳猪/猪堡包/猪油）、**吃掉了** 或 **猪售罄**，会被拦截，不再继续烧烤
 
 **烤群友** - 在群聊中烤一位群友（需 `@` 或回复目标）🍢
 
 * 规则：成功 60% / 逃脱 30% / 反噬 10%
 * 冷却：每位用户默认 8 小时一次（可通过 `ROLLPIG_ROAST_COOLDOWN_HOURS` 调整）
-* 常规模式目标限制：目标需先抽过今日小猪，且不能是 **人类**、**熟食形态** 或 **吃掉了**
-* 失败文案会按发起者当前状态区分（人类/熟食/吃掉了/未抽猪/普通形态）
+* 常规模式目标限制：目标需先抽过今日小猪，且不能是 **人类**、**熟食形态**、**吃掉了** 或 **猪售罄**
+* 失败文案会按发起者当前状态区分（人类/熟食/吃掉了/猪售罄/未抽猪/普通形态）
 * 后门口令（普通用户每日 1 次，强制成功）：`打点后厨` / `偷换烤架` / `贿赂主厨` / `加急生火`（兼容写法：`加急生活`）
 * 后门口令（superuser 无限次，强制成功）：`强行点火`
-* 后门仅绕过 CD 与概率判定，不绕过目标资格（目标仍需已抽猪，且不能是 **人类** / **熟食形态** / **吃掉了**）
+* 后门仅绕过 CD 与概率判定，不绕过目标资格（目标仍需已抽猪，且不能是 **人类** / **熟食形态** / **吃掉了** / **猪售罄**）
 * 指令示例：`烤群友 加急生火 @某人` / 回复目标后发送 `烤群友 强行点火`
 
 **我的猪圈** - 查看解锁进度与专家等级摘要 📊
@@ -117,6 +119,13 @@ ROLLPIG_RESOURCE_MANIFEST_URL=https://pig.felislab.cc/resources/rollpig/manifest
 ROLLPIG_RESOURCE_SYNC_INTERVAL_HOURS=24
 ROLLPIG_RESOURCE_SYNC_TIMEOUT=10.0
 
+# (可选) 私有资源 overlay，Felis 版默认指向 PJSK 私有包
+# 私有包会叠加在公有全量资源包之上；如需关闭可设为空字符串
+ROLLPIG_PRIVATE_RESOURCE_MANIFEST_URL=https://pig.felislab.cc/resources/rollpig-pjsk/manifest.json
+
+# (可选) 私有资源 Bearer Token；静态公开资源可不填
+ROLLPIG_PRIVATE_RESOURCE_TOKEN=replace-with-token
+
 ```
 
 说明：
@@ -130,6 +139,8 @@ ROLLPIG_RESOURCE_SYNC_TIMEOUT=10.0
 * `ROLLPIG_CLOUD_TIMEOUT` 与 `ROLLPIG_CLOUD_STRICT_MODE` 一般保持默认即可，只有明确需要调试云端行为时再调整
 * `ROLLPIG_CLOUD_STRICT_MODE=false` 的含义是：读接口可使用安全兜底值；关键写接口不会偷偷回退本地，而是向用户提示“稍后再试”，避免多 Bot 数据脑裂
 * `ROLLPIG_RESOURCE_SYNC_ENABLED=true` 时，插件会从云端同步 `pig.json`、图片和可选规则文件到本地缓存；同步失败会继续使用旧缓存或插件内置资源
+* `ROLLPIG_PRIVATE_RESOURCE_MANIFEST_URL` 用于覆盖默认私有 overlay 地址；留空则禁用私有包
+* 私有资源也会缓存到本地，优先级高于公有云端资源和插件内置资源；配置留空时不会加载私有缓存
 * 超级用户可发送 `同步小猪资源` / `刷新小猪图鉴` 手动触发资源同步
 * 未接入外部控制台时，群功能与日报默认开启；宿主项目可按需接管开关
 
@@ -162,7 +173,8 @@ nonebot_plugin_rollpig/resource
 * 图片命名需和信息中的 `id` 一致
 * 支持图片类型：`["png", "jpg", "jpeg", "webp", "gif"]`
 * **pig_rules.json** 可选规则文件，用于维护熟食等特殊分类，避免污染上游兼容的 `pig.json` 基础格式
-* 云端同步资源会缓存到本地 `data/localstore/nonebot_plugin_rollpig/resources/`，优先级高于插件内置资源；删除缓存后会自动回退到内置资源
+* 公有云端资源会缓存到本地 `data/localstore/nonebot_plugin_rollpig/resources/active/`，优先级高于插件内置资源；删除缓存后会自动回退到内置资源
+* 私有 overlay 会缓存到本地 `data/localstore/nonebot_plugin_rollpig/resources/private_active/`，优先级高于公有包，适合维护不希望进入上游/公开包的 Bot 专属小猪
 
 
 
@@ -199,6 +211,21 @@ nonebot_plugin_rollpig/
 * 图片自动按 id 匹配，无需在 JSON 中写图片后缀 🐖
 
 
+## v0.6.2 更新日志
+
+### 🔒 私有资源 overlay
+- Felis 版默认叠加 `rollpig-pjsk` 私有资源包，`.env` 可覆盖或留空关闭
+- 支持公有全量包 + 私有外挂包的两层资源加载，私有图片优先级高于公有包
+
+### 🐖 特殊形态
+- 新增 `猪售罄(sold-out)` 特殊形态，今日烤猪、烤群友、随机烤群友与反噬路径均有专属拦截文案
+- 新增 7 月公开小猪资源；热猪、猪咪莓蛋糕、猪咪虾寿司、猪饺纳入熟食规则
+
+### 🔐 安全修复
+- 收紧 `Pillow` 与 `python-dotenv` 依赖下限，规避 GitHub Dependabot 提示的已知漏洞版本
+
+---
+
 ## v0.6.1 更新日志
 
 ### ☁️ 云端资源同步
@@ -209,6 +236,10 @@ nonebot_plugin_rollpig/
 ### 🧩 规则兼容
 - 新增 `pig_rules.json`，将熟食、人类、吃掉了等特殊形态从基础 `pig.json` 拆出
 - 烤猪判定合并内置规则与云端规则，避免新增特殊形态绕过拦截
+
+### 🔒 私有资源 overlay
+- 支持可选私有资源包，例如 `rollpig-pjsk`，在公有全量包之上追加 Bot 专属小猪
+- Felis 版默认拉取 `rollpig-pjsk` 私有 overlay；可通过 `ROLLPIG_PRIVATE_RESOURCE_MANIFEST_URL` 覆盖或留空关闭
 
 ---
 

@@ -28,6 +28,8 @@ CACHE_ROOT = localstore.get_plugin_data_dir() / "resources"
 ACTIVE_RESOURCE_DIR = CACHE_ROOT / "active"
 ACTIVE_IMAGE_DIR = ACTIVE_RESOURCE_DIR / "images"
 STATE_FILE = CACHE_ROOT / "state.json"
+PRIVATE_RESOURCE_DIR = CACHE_ROOT / "private_active"
+PRIVATE_STATE_FILE = CACHE_ROOT / "private_state.json"
 
 PIG_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_IMAGE_SUFFIXES = {".png"}
@@ -48,6 +50,7 @@ class RollPigResourceManager:
         self.food_pig_ids: set[str] = set()
         self.human_pig_ids: set[str] = set()
         self.eaten_pig_ids: set[str] = set()
+        self.sold_pig_ids: set[str] = set()
         self.roast_excluded_pig_ids: set[str] = set()
         self.image_dirs: list[Path] = []
         self.resource_version: str = "builtin"
@@ -60,11 +63,13 @@ class RollPigResourceManager:
         if active_pig_json.exists():
             try:
                 self._load_from_dir(ACTIVE_RESOURCE_DIR, resource_version=self._read_state_version())
+                self._load_private_overlay()
                 return
             except Exception as error:
                 logger.warning(f"rollpig 云端资源缓存读取失败，回退到内置资源: {error}")
 
         self._load_from_builtin()
+        self._load_private_overlay()
 
     def _load_from_builtin(self) -> None:
         self._apply_snapshot(
@@ -85,6 +90,65 @@ class RollPigResourceManager:
             resource_version=resource_version or "cloud",
         )
 
+    def _load_private_overlay(self) -> None:
+        """把私有资源包叠加到当前资源快照上；私有包坏掉时不影响公有包/内置包可用性。"""
+        config = get_plugin_config(Config)
+        try:
+            private_manifest_url = self._resolve_private_manifest_url(config)
+        except Exception as error:
+            logger.warning(f"rollpig 私有资源运行时配置读取失败，已忽略私有 overlay: {error}")
+            return
+        if not private_manifest_url:
+            return
+
+        active_private_pig_json = PRIVATE_RESOURCE_DIR / "pig.json"
+        if not active_private_pig_json.exists():
+            return
+        try:
+            self._apply_private_overlay(PRIVATE_RESOURCE_DIR, resource_version=self._read_private_state_version())
+        except Exception as error:
+            logger.warning(f"rollpig 私有资源缓存读取失败，已忽略私有 overlay: {error}")
+
+    def _apply_private_overlay(self, resource_dir: Path, *, resource_version: str) -> None:
+        # 私有包只允许追加新增猪；覆盖公有猪必须显式写入 pig_overrides.json。
+        private_pigs = self._read_pig_json(resource_dir / "pig.json")
+        private_rules = self._read_rules_json(resource_dir / "pig_rules.json")
+        pig_overrides = self._read_pig_overrides_json(resource_dir / "pig_overrides.json")
+
+        self._ensure_images_exist(private_pigs, [resource_dir / "images"])
+
+        base_ids = set(self.pig_map)
+        duplicate_ids = [str(item["id"]) for item in private_pigs if str(item["id"]) in base_ids]
+        if duplicate_ids:
+            raise ValueError(f"私有资源 pig.json 不能重复公有 ID，请改用 pig_overrides.json: {', '.join(duplicate_ids[:10])}")
+
+        merged_pig_map = {str(item["id"]): dict(item) for item in self.pig_list}
+        for override in pig_overrides:
+            pig_id = str(override["id"])
+            if pig_id not in merged_pig_map:
+                raise ValueError(f"pig_overrides 指向不存在的公有 ID: {pig_id}")
+            updated_item = dict(merged_pig_map[pig_id])
+            updated_item.update({key: value for key, value in override.items() if key != "id"})
+            updated_item["id"] = pig_id
+            merged_pig_map[pig_id] = updated_item
+
+        merged_pig_list = [merged_pig_map[str(item["id"])] for item in self.pig_list]
+        merged_pig_list.extend(private_pigs)
+        self._validate_pig_list(merged_pig_list)
+
+        self.pig_list = merged_pig_list
+        self.pig_map = {str(item["id"]): item for item in merged_pig_list}
+        self.food_pig_ids.update(self._read_id_set(private_rules, "food_pigs"))
+        self.human_pig_ids.update(self._read_id_set(private_rules, "human_pigs"))
+        self.eaten_pig_ids.update(self._read_id_set(private_rules, "eaten_pigs"))
+        self.sold_pig_ids.update(self._read_id_set(private_rules, "sold_pigs"))
+        self.roast_excluded_pig_ids.update(self._read_id_set(private_rules, "roast_excluded_pigs"))
+        self.image_dirs = [resource_dir / "images", *self.image_dirs]
+        self.resource_version = f"{self.resource_version}+{resource_version or 'private'}"
+        logger.info(
+            f"rollpig 私有资源已叠加: version={resource_version}, private_pigs={len(private_pigs)}, total={len(self.pig_list)}"
+        )
+
     def _apply_snapshot(
         self,
         *,
@@ -99,6 +163,7 @@ class RollPigResourceManager:
         self.food_pig_ids = self._read_id_set(rules, "food_pigs")
         self.human_pig_ids = self._read_id_set(rules, "human_pigs")
         self.eaten_pig_ids = self._read_id_set(rules, "eaten_pigs")
+        self.sold_pig_ids = self._read_id_set(rules, "sold_pigs")
         self.roast_excluded_pig_ids = self._read_id_set(rules, "roast_excluded_pigs")
         self.image_dirs = image_dirs
         self.resource_version = resource_version
@@ -118,6 +183,19 @@ class RollPigResourceManager:
             return str(state.get("resource_version") or "cloud")
         except Exception:
             return "cloud"
+
+    def _read_private_state_version(self) -> str:
+        try:
+            state = json.loads(PRIVATE_STATE_FILE.read_text(encoding="utf-8"))
+            return str(state.get("resource_version") or "private")
+        except Exception:
+            return "private"
+
+    def _resolve_private_manifest_url(self, config: Config) -> str:
+        return str(config.rollpig_private_resource_manifest_url or "").strip()
+
+    def _resolve_private_resource_token(self, config: Config) -> str:
+        return str(config.rollpig_private_resource_token or "").strip()
 
     # ================================ 云端同步 ================================ #
     # 同步流程采用“临时目录下载 -> 完整校验 -> 原子替换 active”的方式，避免半包覆盖。
@@ -174,6 +252,64 @@ class RollPigResourceManager:
             message=f"资源同步完成：{resource_version}",
         )
 
+    async def sync_private_from_remote(self, *, force: bool = False) -> ResourceSyncResult:
+        config = get_plugin_config(Config)
+        manifest_url = self._resolve_private_manifest_url(config)
+        if not manifest_url:
+            return ResourceSyncResult(updated=False, skipped=True, message="")
+
+        timeout = max(1.0, float(config.rollpig_resource_sync_timeout or 10.0))
+        headers: dict[str, str] = {}
+        private_token = self._resolve_private_resource_token(config)
+        if private_token:
+            headers["Authorization"] = f"Bearer {private_token}"
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+            manifest = await self._download_json(client, manifest_url, max_size=int(config.rollpig_resource_max_file_size))
+
+            if not bool(manifest.get("overlay")):
+                raise ValueError("私有资源 manifest 必须标记 overlay=true")
+
+            resource_version = str(manifest.get("resource_version") or "").strip()
+            if not resource_version:
+                raise ValueError("私有资源 manifest 缺少 resource_version")
+            if not force and resource_version == self._read_private_state_version():
+                return ResourceSyncResult(
+                    updated=False,
+                    skipped=True,
+                    resource_version=resource_version,
+                    message="私有资源已是最新版本",
+                )
+
+            staging_dir = CACHE_ROOT / f".incoming_private_{int(time.time())}"
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            (staging_dir / "images").mkdir(parents=True, exist_ok=True)
+
+            try:
+                await self._download_private_manifest_files(
+                    client,
+                    manifest_url=manifest_url,
+                    manifest=manifest,
+                    staging_dir=staging_dir,
+                    max_size=int(config.rollpig_resource_max_file_size),
+                )
+                private_pigs = self._read_pig_json(staging_dir / "pig.json")
+                self._ensure_images_exist(private_pigs, [staging_dir / "images"])
+                self._activate_private_staging_dir(staging_dir, resource_version)
+            except Exception:
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir)
+                raise
+
+        self.reload()
+        return ResourceSyncResult(
+            updated=True,
+            skipped=False,
+            resource_version=resource_version,
+            message=f"私有资源同步完成：{resource_version}",
+        )
+
     async def _download_manifest_files(
         self,
         client: httpx.AsyncClient,
@@ -211,6 +347,56 @@ class RollPigResourceManager:
         for image_meta in image_items:
             if not isinstance(image_meta, dict):
                 raise ValueError("manifest images 存在非法条目")
+            filename = str(image_meta.get("filename") or "")
+            self._validate_image_filename(filename)
+            await self._download_file_by_meta(
+                client,
+                manifest_url=manifest_url,
+                meta=image_meta,
+                target=staging_dir / "images" / filename,
+                max_size=max_size,
+            )
+
+    async def _download_private_manifest_files(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        manifest_url: str,
+        manifest: dict[str, Any],
+        staging_dir: Path,
+        max_size: int,
+    ) -> None:
+        pig_json_meta = manifest.get("pig_json")
+        if not isinstance(pig_json_meta, dict):
+            raise ValueError("私有资源 manifest 缺少 pig_json")
+        await self._download_file_by_meta(
+            client,
+            manifest_url=manifest_url,
+            meta=pig_json_meta,
+            target=staging_dir / "pig.json",
+            max_size=max_size,
+        )
+
+        optional_files = manifest.get("optional_files") or {}
+        if not isinstance(optional_files, dict):
+            raise ValueError("私有资源 optional_files 必须是 object")
+        for key, filename in (("pig_rules", "pig_rules.json"), ("pig_overrides", "pig_overrides.json")):
+            file_meta = optional_files.get(key)
+            if isinstance(file_meta, dict):
+                await self._download_file_by_meta(
+                    client,
+                    manifest_url=manifest_url,
+                    meta=file_meta,
+                    target=staging_dir / filename,
+                    max_size=max_size,
+                )
+
+        image_items = manifest.get("images") or []
+        if not isinstance(image_items, list):
+            raise ValueError("私有资源 manifest images 必须是 list")
+        for image_meta in image_items:
+            if not isinstance(image_meta, dict):
+                raise ValueError("私有资源 images 存在非法条目")
             filename = str(image_meta.get("filename") or "")
             self._validate_image_filename(filename)
             await self._download_file_by_meta(
@@ -283,6 +469,26 @@ class RollPigResourceManager:
             encoding="utf-8",
         )
 
+    def _activate_private_staging_dir(self, staging_dir: Path, resource_version: str) -> None:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        previous_dir = CACHE_ROOT / "private_previous"
+        if previous_dir.exists():
+            shutil.rmtree(previous_dir)
+        if PRIVATE_RESOURCE_DIR.exists():
+            PRIVATE_RESOURCE_DIR.rename(previous_dir)
+        staging_dir.rename(PRIVATE_RESOURCE_DIR)
+        PRIVATE_STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "resource_version": resource_version,
+                    "synced_at": int(time.time()),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     # ================================ 校验与解析 ================================ #
     def _read_pig_json(self, path: Path) -> list[dict[str, Any]]:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -296,6 +502,24 @@ class RollPigResourceManager:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"pig_rules.json 必须是 object: {path}")
+        return data
+
+    def _read_pig_overrides_json(self, path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError(f"pig_overrides.json 必须是 list: {path}")
+        seen_ids: set[str] = set()
+        for item in data:
+            if not isinstance(item, dict):
+                raise ValueError("pig_overrides.json 存在非法条目")
+            pig_id = str(item.get("id") or "")
+            if not PIG_ID_PATTERN.match(pig_id):
+                raise ValueError(f"pig_overrides.json 存在非法 ID: {pig_id}")
+            if pig_id in seen_ids:
+                raise ValueError(f"pig_overrides.json 存在重复 ID: {pig_id}")
+            seen_ids.add(pig_id)
         return data
 
     def _validate_pig_list(self, pig_list: list[dict[str, Any]]) -> None:

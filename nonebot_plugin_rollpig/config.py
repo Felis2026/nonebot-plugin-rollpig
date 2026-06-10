@@ -21,6 +21,9 @@ class Config(BaseModel):
     rollpig_resource_sync_interval_hours: int = 24
     rollpig_resource_sync_timeout: float = 10.0
     rollpig_resource_max_file_size: int = 10 * 1024 * 1024
+    # 私有资源包是公有全量包之上的 overlay；Felis 版默认启用 PJSK 私有包，可用 .env 覆盖或设空关闭。
+    rollpig_private_resource_manifest_url: Optional[str] = "https://pig.felislab.cc/resources/rollpig-pjsk/manifest.json"
+    rollpig_private_resource_token: Optional[str] = None
 
     # --- 代理设置 (可选，如果服务器在国内连不上API) ---
     rollpig_proxy: Optional[str] = None
