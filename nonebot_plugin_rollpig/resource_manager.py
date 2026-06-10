@@ -179,14 +179,14 @@ class RollPigResourceManager:
 
     def _read_state_version(self) -> str:
         try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            state = json.loads(self._read_json_text(STATE_FILE))
             return str(state.get("resource_version") or "cloud")
         except Exception:
             return "cloud"
 
     def _read_private_state_version(self) -> str:
         try:
-            state = json.loads(PRIVATE_STATE_FILE.read_text(encoding="utf-8"))
+            state = json.loads(self._read_json_text(PRIVATE_STATE_FILE))
             return str(state.get("resource_version") or "private")
         except Exception:
             return "private"
@@ -409,7 +409,7 @@ class RollPigResourceManager:
 
     async def _download_json(self, client: httpx.AsyncClient, url: str, *, max_size: int) -> dict[str, Any]:
         content = await self._download_bytes(client, url, max_size=max_size)
-        data = json.loads(content.decode("utf-8"))
+        data = json.loads(content.decode("utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("manifest 必须是 JSON object")
         return data
@@ -490,8 +490,12 @@ class RollPigResourceManager:
         )
 
     # ================================ 校验与解析 ================================ #
+    def _read_json_text(self, path: Path) -> str:
+        """读取资源 JSON 文本；兼容 1Panel/Windows 上传链路偶发写入的 UTF-8 BOM。"""
+        return path.read_text(encoding="utf-8-sig")
+
     def _read_pig_json(self, path: Path) -> list[dict[str, Any]]:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(self._read_json_text(path))
         if not isinstance(data, list):
             raise ValueError(f"pig.json 必须是 list: {path}")
         return data
@@ -499,7 +503,7 @@ class RollPigResourceManager:
     def _read_rules_json(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(self._read_json_text(path))
         if not isinstance(data, dict):
             raise ValueError(f"pig_rules.json 必须是 object: {path}")
         return data
@@ -507,7 +511,7 @@ class RollPigResourceManager:
     def _read_pig_overrides_json(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(self._read_json_text(path))
         if not isinstance(data, list):
             raise ValueError(f"pig_overrides.json 必须是 list: {path}")
         seen_ids: set[str] = set()
