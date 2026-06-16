@@ -257,7 +257,7 @@ def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pig
             for pig_id, progress in repeat_items:
                 pig = get_pig_by_id(pig_id)
                 pig_name = pig.get("name", pig_id) if pig else pig_id
-                parts.append(f"【{pig_name}】EX Lv.{get_expert_level(progress.copies)}×{progress.copies}")
+                parts.append(f"【{pig_name}】EX Lv.{get_expert_level(progress.copies)}")
             top_repeat_line = "⭐ 高等级小猪：" + "、".join(parts)
 
     if draw_state.duplicate_streak > 0:
