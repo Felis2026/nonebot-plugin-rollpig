@@ -245,7 +245,7 @@ def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pig
         favorite = get_pig_by_id(favorite_id)
         favorite_name = favorite.get("name", favorite_id) if favorite else favorite_id
         favorite_level = get_expert_level(favorite_progress.copies)
-        favorite_line = f"🐷 本命猪：【{favorite_name}】专家等级 EX Lv. {favorite_level}（累计 {favorite_progress.copies} 次）"
+        favorite_line = f"🐷 本命猪：【{favorite_name}】EX Lv.{favorite_level}（累计 {favorite_progress.copies} 次）"
 
         repeat_items = [
             (pig_id, progress)
@@ -265,6 +265,8 @@ def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pig
     else:
         streak_line = "🔥 连续重复：0 次（下一只从平常心开始）"
 
+    footer_line = "发送「今日小猪」开始收集。" if user_count <= 0 else "完整图鉴图还在施工，先把成长进度记牢。"
+
     return (
         f"【我的猪圈统计】\n"
         f"👑 猪圈主人：{user_name}\n"
@@ -275,7 +277,7 @@ def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pig
         f"{top_repeat_line}\n"
         f"{streak_line}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"完整图鉴图还在施工，先把成长进度记牢。"
+        f"{footer_line}"
     )
 
 
