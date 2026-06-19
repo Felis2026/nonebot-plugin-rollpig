@@ -41,6 +41,16 @@ class DailyRollResult:
 class CooldownConsumeResult:
     allowed: bool
     remaining_seconds: int = 0
+    charges_left: int = 0
+    max_charges: int = 1
+    next_recover_seconds: int = 0
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    draw_state: DrawState
+    recent_rolls: dict[str, str]
+    roasted_7d: int = 0
 
 
 @dataclass(frozen=True)

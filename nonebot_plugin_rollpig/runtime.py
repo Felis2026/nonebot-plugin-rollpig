@@ -33,6 +33,21 @@ def resolve_roast_cooldown_seconds() -> int:
     return max(1, int(hours * 3600))
 
 
+def resolve_roast_charge_max() -> int:
+    """解析普通烤群友充能上限；第一版限制在 1~6，避免群内刷屏。"""
+    plugin_config = get_plugin_config(Config)
+    raw_max = getattr(plugin_config, "rollpig_roast_charge_max", 2)
+    try:
+        max_charges = int(raw_max)
+    except (TypeError, ValueError):
+        logger.warning(f"rollpig_roast_charge_max 配置非法: {raw_max}，已回退到 2")
+        max_charges = 2
+    if max_charges <= 0:
+        logger.warning(f"rollpig_roast_charge_max 必须 > 0，当前值: {max_charges}，已回退到 2")
+        max_charges = 2
+    return max(1, min(6, max_charges))
+
+
 def set_group_enable_checker(checker: Optional[Callable[[str], bool]]) -> None:
     """注册外部群启用检查器；传入 None 时恢复为“未接控制台，默认开启”模式。"""
     global _group_enable_checker

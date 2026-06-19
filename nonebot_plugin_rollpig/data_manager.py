@@ -9,9 +9,50 @@ from nonebot.log import logger
 import nonebot_plugin_localstore as store
 
 from .runtime import resolve_roast_cooldown_seconds
-from .store.models import DailyRollResult, DrawState, PigProgress
+from .store.models import CatalogSnapshot, CooldownConsumeResult, DailyRollResult, DrawState, PigProgress
 
 ROAST_COOLDOWN_SECONDS = resolve_roast_cooldown_seconds()
+DEFAULT_ROAST_CHARGE_MAX = 2
+
+
+def _normalize_charge_settings(cooldown_seconds: Optional[int], max_charges: Optional[int]) -> tuple[int, int]:
+    """本地 JSON 与 cloud 使用同一组边界，避免两种后端表现不一致。"""
+    cooldown = max(60, int(cooldown_seconds or ROAST_COOLDOWN_SECONDS))
+    charge_max = max(1, min(6, int(max_charges or DEFAULT_ROAST_CHARGE_MAX)))
+    return cooldown, charge_max
+
+
+def _legacy_roast_state(last_use: float, now: float, cooldown: int, max_charges: int) -> tuple[int, float]:
+    """把旧单时间戳 CD 宽松迁移为充能桶：最近一次使用后视为还剩 1 格。"""
+    if last_use <= 0:
+        return max_charges, now
+    elapsed = max(0.0, now - last_use)
+    recovered = int(elapsed // cooldown)
+    charges = min(max_charges, 1 + recovered)
+    updated_ts = now if charges >= max_charges else last_use + recovered * cooldown
+    return int(charges), float(updated_ts)
+
+
+def _recover_roast_charges(charges: int, updated_ts: float, now: float, cooldown: int, max_charges: int) -> tuple[int, float]:
+    """按 token bucket 恢复普通烤群友次数；满格后把锚点归到当前时间。"""
+    charges = max(0, min(max_charges, int(charges)))
+    updated_ts = float(updated_ts or now)
+    if charges >= max_charges:
+        return max_charges, now
+    elapsed = max(0.0, now - updated_ts)
+    recovered = int(elapsed // cooldown)
+    if recovered <= 0:
+        return charges, updated_ts
+    charges = min(max_charges, charges + recovered)
+    updated_ts = now if charges >= max_charges else updated_ts + recovered * cooldown
+    return int(charges), float(updated_ts)
+
+
+def _next_charge_seconds(charges: int, updated_ts: float, now: float, cooldown: int, max_charges: int) -> int:
+    if charges >= max_charges:
+        return 0
+    elapsed = max(0.0, now - float(updated_ts or now))
+    return max(1, int(cooldown - (elapsed % cooldown)))
 
 # ================= 数据管理 =================
 
@@ -29,7 +70,7 @@ class PigDataManager:
     - collection : {user_id: [pig_id, ...]}   ← 永久保留，图鉴数据
     - pig_progress: {user_id: {pig_id: {copies, first_obtained_at}}} ← P1A 抽到次数/专家等级
     - draw_state : {user_id: {duplicate_streak}} ← P1A 连续重复次数，用于伪保底
-    - usage      : {user_id: timestamp}        ← 烤群友普通模式 CD 时间戳
+    - usage      : {user_id: {last_roast_ts, roast_charges, roast_charge_updated_ts}} ← 普通烤群友充能
     - force_usage: {user_id: "YYYY-MM-DD"}    ← 后门口令每日计数
     - daily_events: {date: [event, ...]}      ← 群内烧烤事件（用于日报）
 
@@ -404,29 +445,31 @@ class PigDataManager:
             if history_dates_to_del or group_dates_to_del:
                 await self._atomic_save()
 
-    # ---- 烤群友 普通模式 CD ----
+    # ---- 烤群友 普通模式充能 ----
 
     def check_roast_usage(self, user_id: str) -> tuple[bool, str]:
         """
-        检查普通烤群友 CD 是否已过。
+        检查普通烤群友是否还有可用充能。
         返回: (是否可用, 若不可用时的提示信息)
         """
-        # 兼容旧版数据结构
-        if "usage" not in self.data or not isinstance(self.data["usage"], dict):
-            self.data["usage"] = {}
-        if self.data["usage"] and isinstance(list(self.data["usage"].values())[0], dict):
-            self.data["usage"] = {}
+        usage = self.data.setdefault("usage", {})
+        raw_state = usage.get(user_id, 0)
+        now = float(time.time())
+        cooldown, max_charges = _normalize_charge_settings(ROAST_COOLDOWN_SECONDS, DEFAULT_ROAST_CHARGE_MAX)
 
-        last_use = self.data["usage"].get(user_id, 0)
-        now = time.time()
-        cooldown = ROAST_COOLDOWN_SECONDS
+        if isinstance(raw_state, dict):
+            charges = _safe_int(raw_state.get("roast_charges"), 0)
+            updated_ts = float(raw_state.get("roast_charge_updated_ts") or now)
+        else:
+            charges, updated_ts = _legacy_roast_state(float(raw_state or 0), now, cooldown, max_charges)
 
-        if now - last_use < cooldown:
-            remaining = int(cooldown - (now - last_use))
+        charges, updated_ts = _recover_roast_charges(charges, updated_ts, now, cooldown, max_charges)
+        if charges <= 0:
+            remaining = _next_charge_seconds(charges, updated_ts, now, cooldown, max_charges)
             m, s = divmod(remaining, 60)
             h, m = divmod(m, 60)
             time_str = f"{h}小时{m}分" if h > 0 else f"{m}分{s}秒"
-            return False, f"技能冷却中！还需要休息 {time_str} 才能再次烧烤。"
+            return False, f"烧烤充能恢复中！还需要 {time_str} 恢复 1 次。"
 
         return True, ""
 
@@ -435,32 +478,64 @@ class PigDataManager:
         user_id: str,
         now_ts: Optional[float] = None,
         cooldown_seconds: Optional[int] = None,
-    ) -> tuple[bool, int]:
+        max_charges: Optional[int] = None,
+    ) -> CooldownConsumeResult:
         now = float(now_ts or time.time())
-        cooldown = cooldown_seconds or ROAST_COOLDOWN_SECONDS
+        cooldown, charge_max = _normalize_charge_settings(cooldown_seconds, max_charges)
         async with self._lock:
             usage = self.data.setdefault("usage", {})
-            if usage and isinstance(list(usage.values())[0], dict):
-                self.data["usage"] = {}
-                usage = self.data["usage"]
+            raw_state = usage.get(user_id, 0)
+            if isinstance(raw_state, dict):
+                charges = _safe_int(raw_state.get("roast_charges"), 0)
+                updated_ts = float(raw_state.get("roast_charge_updated_ts") or now)
+            else:
+                charges, updated_ts = _legacy_roast_state(float(raw_state or 0), now, cooldown, charge_max)
 
-            last_use = float(usage.get(user_id, 0) or 0)
-            remaining = max(0, int(cooldown - (now - last_use)))
-            if remaining > 0:
-                return False, remaining
+            charges, updated_ts = _recover_roast_charges(charges, updated_ts, now, cooldown, charge_max)
+            if charges <= 0:
+                remaining = _next_charge_seconds(charges, updated_ts, now, cooldown, charge_max)
+                usage[user_id] = {
+                    "last_roast_ts": float(raw_state or 0) if not isinstance(raw_state, dict) else raw_state.get("last_roast_ts"),
+                    "roast_charges": charges,
+                    "roast_charge_updated_ts": updated_ts,
+                }
+                await self._atomic_save()
+                return CooldownConsumeResult(
+                    allowed=False,
+                    remaining_seconds=remaining,
+                    charges_left=0,
+                    max_charges=charge_max,
+                    next_recover_seconds=remaining,
+                )
 
-            usage[user_id] = now
+            was_full = charges >= charge_max
+            charges -= 1
+            if was_full:
+                updated_ts = now
+            usage[user_id] = {
+                "last_roast_ts": now,
+                "roast_charges": charges,
+                "roast_charge_updated_ts": updated_ts,
+            }
             await self._atomic_save()
-            return True, 0
+            return CooldownConsumeResult(
+                allowed=True,
+                remaining_seconds=0,
+                charges_left=charges,
+                max_charges=charge_max,
+                next_recover_seconds=_next_charge_seconds(charges, updated_ts, now, cooldown, charge_max),
+            )
 
     async def update_roast_usage(self, user_id: str):
         """记录本次使用时间戳。"""
         async with self._lock:
             usage = self.data.setdefault("usage", {})
-            # 兼容旧版嵌套 dict 格式
-            if usage and isinstance(list(usage.values())[0], dict):
-                self.data["usage"] = {}
-            self.data["usage"][user_id] = time.time()
+            now = time.time()
+            usage[user_id] = {
+                "last_roast_ts": now,
+                "roast_charges": max(0, DEFAULT_ROAST_CHARGE_MAX - 1),
+                "roast_charge_updated_ts": now,
+            }
             await self._atomic_save()
 
     # ---- 烤群友 后门口令 每日计数 ----
@@ -520,6 +595,51 @@ class PigDataManager:
         if not group_id:
             return events
         return [e for e in events if e.get("group_id") == group_id]
+
+    def get_recent_rolls(self, user_id: str, days: int = 14) -> dict[str, str]:
+        """返回最近若干天的抽猪记录；图鉴只读使用，不会修改 copies。"""
+        today = datetime.date.today()
+        safe_days = max(1, min(60, int(days or 14)))
+        start_date = today - datetime.timedelta(days=safe_days - 1)
+        result: dict[str, str] = {}
+        for date_str, rows in self.data.get("history", {}).items():
+            if not _is_valid_date(date_str) or not isinstance(rows, dict):
+                continue
+            date_obj = datetime.date.fromisoformat(date_str)
+            if start_date <= date_obj <= today:
+                pig_id = rows.get(str(user_id))
+                if pig_id:
+                    result[date_str] = str(pig_id)
+        return dict(sorted(result.items(), reverse=True))
+
+    def count_success_roasted(self, user_id: str, days: int = 7) -> int:
+        """统计用户近 N 天成功被烤次数；逃脱/反噬不算“被烤成功”。"""
+        today = datetime.date.today()
+        safe_days = max(1, min(60, int(days or 7)))
+        start_date = today - datetime.timedelta(days=safe_days - 1)
+        total = 0
+        for date_str, events in self.data.get("daily_events", {}).items():
+            if not _is_valid_date(date_str) or not isinstance(events, list):
+                continue
+            date_obj = datetime.date.fromisoformat(date_str)
+            if not (start_date <= date_obj <= today):
+                continue
+            total += sum(
+                1
+                for event in events
+                if isinstance(event, dict)
+                and event.get("type") == "success"
+                and str(event.get("target") or "") == str(user_id)
+            )
+        return total
+
+    def get_catalog_snapshot(self, user_id: str, days: int = 14) -> CatalogSnapshot:
+        """聚合图片版图鉴需要的本地只读数据，避免命令层多处手算。"""
+        return CatalogSnapshot(
+            draw_state=self.get_draw_state(user_id),
+            recent_rolls=self.get_recent_rolls(user_id, days=days),
+            roasted_7d=self.count_success_roasted(user_id, days=7),
+        )
 
     def get_group_rolls(self, group_id: str, date_str: Optional[str] = None) -> dict:
         """获取指定群在某天登记过的今日形态。"""

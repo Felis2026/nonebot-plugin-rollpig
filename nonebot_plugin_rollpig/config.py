@@ -1,13 +1,56 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Optional
+
 from pydantic import BaseModel
-from typing import Optional
+
+
+def _load_json_config_file() -> dict[str, Any]:
+    """读取可选 JSON 配置；缺失或为空时等价于不配置，不影响插件启动。"""
+    env_path = os.getenv("ROLLPIG_CONFIG_FILE", "").strip()
+    candidate_paths = [
+        Path(env_path) if env_path else None,
+        Path.cwd() / "rollpig_config.json",
+        Path.cwd() / "config" / "rollpig.json",
+    ]
+    for raw_path in candidate_paths:
+        if raw_path is None:
+            continue
+        path = raw_path.expanduser()
+        if not path.exists():
+            continue
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError(f"rollpig JSON 配置必须是 object: {path}")
+        nested = data.get("rollpig")
+        if isinstance(nested, dict):
+            data = nested
+        return {str(key).lower(): value for key, value in data.items()}
+    return {}
+
+
+def _merge_json_config(env_data: dict[str, Any]) -> dict[str, Any]:
+    """JSON 负责降低 .env 负担；NoneBot/.env 传入值始终覆盖 JSON。"""
+    json_data = _load_json_config_file()
+    if not json_data:
+        return env_data
+    normalized_env = {str(key).lower(): value for key, value in env_data.items() if value is not None}
+    return {**json_data, **normalized_env}
 
 class Config(BaseModel):
+    def __init__(self, **data: Any):
+        super().__init__(**_merge_json_config(data))
+
     # --- AI 烤猪配置 ---
     rollpig_ai_enabled: bool = False  # 是否开启 AI 生成
     rollpig_deepseek_key: Optional[str] = None  # DeepSeek API Key
     rollpig_deepseek_base: str = "https://api.deepseek.com" # Base URL
     rollpig_model: str = "deepseek-chat" # 模型名称
     rollpig_roast_cooldown_hours: float = 8.0  # 烤群友普通模式冷却时长（小时）
+    rollpig_roast_charge_max: int = 2  # 普通烤群友最多可储存次数
     rollpig_storage_backend: str = "local"  # local / cloud
     rollpig_cloud_api_url: Optional[str] = None
     rollpig_cloud_token: Optional[str] = None
@@ -24,6 +67,14 @@ class Config(BaseModel):
     # 私有资源包是公有全量包之上的 overlay；Felis 版默认启用 PJSK 私有包，可用 .env 覆盖或设空关闭。
     rollpig_private_resource_manifest_url: Optional[str] = "https://pig.felislab.cc/resources/rollpig-pjsk/manifest.json"
     rollpig_private_resource_token: Optional[str] = None
+
+    # --- 图片版小猪图鉴 ---
+    rollpig_catalog_enabled: bool = True
+    rollpig_catalog_render_concurrency: int = 2
+    rollpig_catalog_cache_seconds: int = 300
+    rollpig_catalog_output_format: str = "png"
+    rollpig_catalog_render_timeout: float = 8.0
+    rollpig_catalog_scale_factor: float = 2.0
 
     # --- 代理设置 (可选，如果服务器在国内连不上API) ---
     rollpig_proxy: Optional[str] = None

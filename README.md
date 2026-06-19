@@ -21,7 +21,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6.2"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7.0"
 
 ```
 
@@ -60,7 +60,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6
 **烤群友** - 在群聊中烤一位群友（需 `@` 或回复目标）🍢
 
 * 规则：成功 60% / 逃脱 30% / 反噬 10%
-* 冷却：每位用户默认 8 小时一次（可通过 `ROLLPIG_ROAST_COOLDOWN_HOURS` 调整）
+* 充能：普通烤群友默认最多储存 2 次，每 8 小时恢复 1 次（可通过 `ROLLPIG_ROAST_CHARGE_MAX` / `ROLLPIG_ROAST_COOLDOWN_HOURS` 调整）
 * 常规模式目标限制：目标需先抽过今日小猪，且不能是 **人类**、**熟食形态**、**吃掉了** 或 **猪售罄**
 * 失败文案会按发起者当前状态区分（人类/熟食/吃掉了/猪售罄/未抽猪/普通形态）
 * 后门口令（普通用户每日 1 次，强制成功）：`打点后厨` / `偷换烤架` / `贿赂主厨` / `加急生火`（兼容写法：`加急生活`）
@@ -70,78 +70,84 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.6
 
 **我的猪圈** - 查看解锁进度与专家等级摘要 📊
 
+**小猪图鉴** - 生成图片版小猪图鉴；可加页码，例如 `小猪图鉴 2` 🖼️
+
 **本周小猪** - 生成本周猪猪总结长图 🖼️
 
 ---
 
 ### ⚙️ 配置方法 (可选) ⚙️
 
-如果你想开启 **“AI 烤猪”** 功能（让文案不再千篇一律），请在 Bot 根目录的 `.env` 文件中添加以下配置：
+插件内置完整默认值：不写 `.env`、不写 JSON 也不会报错。配置优先级为 `.env / NoneBot 配置 > JSON 配置文件 > 插件默认值`。
 
-```properties
-# 开启 AI 生成开关 (默认关闭)
-ROLLPIG_AI_ENABLED=true
+推荐分工：
 
-# 填入 DeepSeek API Key
-ROLLPIG_DEEPSEEK_KEY=sk-xxxxxxxxxxxxxxxx
+* **JSON 配置文件**：放非敏感、稳定参数。默认读取 Bot 运行目录下的 `rollpig_config.json`，也会读取 `config/rollpig.json`。
+* **`.env`**：放 Token / Key / 私密覆盖项；如需自定义 JSON 路径，只在 `.env` 写 `ROLLPIG_CONFIG_FILE=/path/to/rollpig_config.json`。
 
-# (可选) 自定义模型名称，默认 deepseek-chat
-ROLLPIG_MODEL=deepseek-chat
+下面用 `jsonc` 展示注释方便阅读；实际 `rollpig_config.json` 需要使用合法 JSON，可直接参考仓库内的 `rollpig_config.example.json`。
 
-# (可选) 自定义 API 地址
-ROLLPIG_DEEPSEEK_BASE=https://api.deepseek.com
+```jsonc
+{
+  "rollpig": {
+    // ================================ AI 烤猪 ================================ //
+    "rollpig_ai_enabled": false,               // 是否启用 AI 烤猪；只填 Key 不会自动开启
+    "rollpig_model": "deepseek-chat",          // AI 模型名称，默认 DeepSeek Chat
+    "rollpig_roast_cooldown_hours": 8,         // 普通烤群友每恢复 1 次所需小时数
+    "rollpig_roast_charge_max": 2,             // 普通烤群友最多可储存次数；后门/强行点火不消耗
 
-# (可选) 烤群友普通模式 CD（单位小时，默认 8）
-ROLLPIG_ROAST_COOLDOWN_HOURS=8
+    // ================================ 存储与云端 ================================ //
+    "rollpig_storage_backend": "local",        // local=本地 JSON；cloud=rollpig-cloud 多 Bot 同步
+    "rollpig_cloud_api_url": "http://127.0.0.1:8011", // cloud 模式的 rollpig-cloud 地址
+    "rollpig_cloud_timeout": 3.0,              // 请求 rollpig-cloud 的超时时间（秒）
+    "rollpig_cloud_strict_mode": true,         // true=云端异常直接失败；false=读接口可安全兜底
 
-# 如果你想启用云同步，可自行部署 rollpig-cloud：
-# https://github.com/Felis2026/rollpig-cloud
-# 也可以联系维护者（QQ：3397152010）申请接入现有 API
-#
-# (可选) 存储后端，默认 local；启用云同步时改为 cloud
-ROLLPIG_STORAGE_BACKEND=cloud
+    // ================================ 小猪资源包 ================================ //
+    "rollpig_resource_sync_enabled": true,     // 是否自动同步云端资源包；失败会回退旧缓存/内置资源
+    "rollpig_resource_manifest_url": "https://pig.felislab.cc/resources/rollpig/manifest.json", // 公有全量包
+    "rollpig_resource_sync_interval_hours": 24, // 自动检查资源更新的间隔小时数
+    "rollpig_resource_sync_timeout": 10.0,     // 下载 manifest / pig.json / 图片的超时时间（秒）
+    "rollpig_private_resource_manifest_url": "https://pig.felislab.cc/resources/rollpig-pjsk/manifest.json", // Felis 分支默认启用的 PJSK 私有 overlay；设为 "" 可关闭
 
-# (可选) rollpig-cloud 服务地址
-ROLLPIG_CLOUD_API_URL=http://127.0.0.1:8011
-
-# (可选) rollpig-cloud Bearer Token
-ROLLPIG_CLOUD_TOKEN=replace-with-token
-
-# (可选) 云端请求超时（秒）
-ROLLPIG_CLOUD_TIMEOUT=3.0
-
-# (可选) 云端请求严格模式，默认 true
-ROLLPIG_CLOUD_STRICT_MODE=true
-
-# (可选) 小猪资源云端同步，默认启用并指向 FelisLab 资源包
-ROLLPIG_RESOURCE_SYNC_ENABLED=true
-ROLLPIG_RESOURCE_MANIFEST_URL=https://pig.felislab.cc/resources/rollpig/manifest.json
-ROLLPIG_RESOURCE_SYNC_INTERVAL_HOURS=24
-ROLLPIG_RESOURCE_SYNC_TIMEOUT=10.0
-
-# (可选) 私有资源 overlay，Felis 版默认指向 PJSK 私有包
-# 私有包会叠加在公有全量资源包之上；如需关闭可设为空字符串
-ROLLPIG_PRIVATE_RESOURCE_MANIFEST_URL=https://pig.felislab.cc/resources/rollpig-pjsk/manifest.json
-
-# (可选) 私有资源 Bearer Token；静态公开资源可不填
-ROLLPIG_PRIVATE_RESOURCE_TOKEN=replace-with-token
-
+    // ================================ 图片版小猪图鉴 ================================ //
+    "rollpig_catalog_enabled": true,           // 是否启用“小猪图鉴”图片命令；不替代“我的猪圈”
+    "rollpig_catalog_render_concurrency": 2,   // 常驻 Playwright 页面池上限；小内存机器建议 1~2，大内存/高并发情况可覆盖到 4~6
+    "rollpig_catalog_cache_seconds": 300,      // 同一状态指纹的图鉴结果缓存秒数，不会额外刷新 copies
+    "rollpig_catalog_output_format": "png",   // 输出格式；本分支默认 PNG
+    "rollpig_catalog_render_timeout": 8.0,     // 单张图鉴渲染超时时间（秒）
+    "rollpig_catalog_scale_factor": 2.0        // 2x 渲染再输出，提升文字和徽章清晰度
+  }
+}
 ```
 
-说明：
+建议留在 `.env` 的敏感项与路径覆盖：
+
+```properties
+# DeepSeek API Key；仅填写 Key 不会开启 AI，还需在 JSON 或 .env 中设置 ROLLPIG_AI_ENABLED=true
+ROLLPIG_DEEPSEEK_KEY=sk-xxxxxxxxxxxxxxxx
+
+# rollpig-cloud Bearer Token
+ROLLPIG_CLOUD_TOKEN=replace-with-token
+
+# 私有资源 Bearer Token；当前 FelisLab 静态私有包不需要，只有自建鉴权资源服务时才填
+ROLLPIG_PRIVATE_RESOURCE_TOKEN=replace-with-token
+
+# 可选：指定 JSON 配置文件位置
+ROLLPIG_CONFIG_FILE=/path/to/rollpig_config.json
+```
+
+补充说明：
 
 * 仅设置 `ROLLPIG_DEEPSEEK_KEY` 不会触发 AI，需同时开启 `ROLLPIG_AI_ENABLED=true`
 * 未开启 AI 或未配置 Key 时，会自动回退到本地文案模板
-* 后续可能会继续扩展为“云端同步文案库”模式；当前版本仍以本地模板 / AI 生成两种方式为主
-* `ROLLPIG_ROAST_COOLDOWN_HOURS` 仅影响普通模式；后门模式不会改写普通 CD 时间戳
 * 未配置云端时，插件默认继续使用本地 `pig_data.json` 存储，不影响单 Bot 正常运行
-* `ROLLPIG_STORAGE_BACKEND=cloud` 时，`今日小猪`、图鉴成长状态、普通 CD、后门次数将在多 Bot 间同步；日报与保护按群聚合/生效
-* `ROLLPIG_CLOUD_TIMEOUT` 与 `ROLLPIG_CLOUD_STRICT_MODE` 一般保持默认即可，只有明确需要调试云端行为时再调整
+* 云同步可自行部署 `rollpig-cloud`：`https://github.com/Felis2026/rollpig-cloud`；也可以联系维护者（QQ：3397152010）申请接入现有 API
+* `ROLLPIG_STORAGE_BACKEND=cloud` 时，`今日小猪`、图鉴成长状态、普通烤群友充能、后门次数将在多 Bot 间同步；日报与保护按群聚合/生效
 * `ROLLPIG_CLOUD_STRICT_MODE=false` 的含义是：读接口可使用安全兜底值；关键写接口不会偷偷回退本地，而是向用户提示“稍后再试”，避免多 Bot 数据脑裂
-* `ROLLPIG_RESOURCE_SYNC_ENABLED=true` 时，插件会从云端同步 `pig.json`、图片和可选规则文件到本地缓存；同步失败会继续使用旧缓存或插件内置资源
-* `ROLLPIG_PRIVATE_RESOURCE_MANIFEST_URL` 用于覆盖默认私有 overlay 地址；留空则禁用私有包
-* 私有资源也会缓存到本地，优先级高于公有云端资源和插件内置资源；配置留空时不会加载私有缓存
+* `ROLLPIG_PRIVATE_RESOURCE_MANIFEST_URL` 用于覆盖默认私有 overlay 地址；写成空字符串 `""` 才会禁用私有包
+* 私有资源也会缓存到本地，优先级高于公有云端资源和插件内置资源；当前默认地址不需要 token，配置留空时不会加载私有缓存
 * 超级用户可发送 `同步小猪资源` / `刷新小猪图鉴` 手动触发资源同步
+* 图片版图鉴每页固定展示 38 只小猪，不提供配置项，避免和当前底图安全区错位
 * 未接入外部控制台时，群功能与日报默认开启；宿主项目可按需接管开关
 
 ---
@@ -171,7 +177,7 @@ nonebot_plugin_rollpig/resource
 
 * **image/** 小猪图片
 * 图片命名需和信息中的 `id` 一致
-* 支持图片类型：`["png", "jpg", "jpeg", "webp", "gif"]`
+* 当前稳定支持图片类型：`png`
 * **pig_rules.json** 可选规则文件，用于维护熟食等特殊分类，避免污染上游兼容的 `pig.json` 基础格式
 * 公有云端资源会缓存到本地 `data/localstore/nonebot_plugin_rollpig/resources/active/`，优先级高于插件内置资源；删除缓存后会自动回退到内置资源
 * 私有 overlay 会缓存到本地 `data/localstore/nonebot_plugin_rollpig/resources/private_active/`，优先级高于公有包，适合维护不希望进入上游/公开包的 Bot 专属小猪
@@ -185,6 +191,7 @@ nonebot_plugin_rollpig/resource
 ```
 nonebot_plugin_rollpig/
 ├─ __init__.py
+├─ catalog_renderer.py # 图片版小猪图鉴渲染
 ├─ config.py           # 配置模型
 ├─ resource_manager.py # 云端小猪资源同步与本地缓存加载
 ├─ data_manager.py     # 本地 JSON 存储实现
@@ -199,6 +206,8 @@ nonebot_plugin_rollpig/
 ├─ resource/
 │   ├─ pig.json
 │   ├─ pig_rules.json
+│   ├─ catalog_base.png
+│   ├─ catalog_template.html
 │   └─ image/
 │       └─ pig.png
 ```
@@ -210,6 +219,25 @@ nonebot_plugin_rollpig/
 * 新增小猪时只需在 `pig.json` 添加对象，并将对应图片放到 `image/` 文件夹即可 🐷
 * 图片自动按 id 匹配，无需在 JSON 中写图片后缀 🐖
 
+
+## v0.7.0 更新日志
+
+### 🖼️ 图片版小猪图鉴
+- 新增 `小猪图鉴` / `猪猪图鉴` / `完整图鉴` 命令，独立于 `我的猪圈` 文本摘要
+- 采用 HTML/CSS + 底图渲染，显示已解锁小猪、EX Lv.、MAX / NEW 标记、进度条、本命猪与趣味统计
+- 图鉴渲染使用状态指纹短时缓存；只读现有状态，不会额外刷新 `copies`
+
+### ⚙️ 配置与性能
+- 支持 `rollpig_config.json` / `config/rollpig.json` 承载非敏感配置，`.env` 仍保持最高优先级
+- 新增图鉴常驻页面池、渲染并发与缓存配置，公开默认 PNG、页面池上限 2、缓存 300 秒
+- 云端模式新增图鉴聚合接口，减少生成单张图时的 API 往返
+
+### 🍢 烤群友充能
+- 普通烤群友从单次 CD 改为充能桶，默认最多 2 次，每 8 小时恢复 1 次
+- 后门口令与 superuser `强行点火` 不消耗普通充能
+- 本地 JSON 与 rollpig-cloud 均兼容旧 `last_roast_ts` 数据迁移
+
+---
 
 ## v0.6.2 更新日志
 

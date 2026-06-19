@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .base import RollpigStore
-from .models import CooldownConsumeResult, DailyRollResult, DrawState, RoastEvent
+from .models import CatalogSnapshot, CooldownConsumeResult, DailyRollResult, DrawState, RoastEvent
 
 if TYPE_CHECKING:
     from ..data_manager import PigDataManager
@@ -63,13 +63,17 @@ class LocalJsonStore(RollpigStore):
         user_id: str,
         now_ts: Optional[float] = None,
         cooldown_seconds: Optional[int] = None,
+        max_charges: Optional[int] = None,
     ) -> CooldownConsumeResult:
-        allowed, remaining_seconds = await self.manager.consume_roast_usage(
+        return await self.manager.consume_roast_usage(
             user_id,
             now_ts=now_ts,
             cooldown_seconds=cooldown_seconds,
+            max_charges=max_charges,
         )
-        return CooldownConsumeResult(allowed=allowed, remaining_seconds=remaining_seconds)
+
+    async def get_catalog_snapshot(self, user_id: str, days: int = 14) -> CatalogSnapshot:
+        return self.manager.get_catalog_snapshot(user_id, days=days)
 
     async def consume_force_usage(self, user_id: str, date_str: Optional[str] = None) -> bool:
         return await self.manager.consume_force_roast_usage(user_id, date_str=date_str)

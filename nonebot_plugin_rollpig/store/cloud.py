@@ -9,7 +9,7 @@ from nonebot.log import logger
 
 from ..config import Config
 from .base import RollpigStore
-from .models import CooldownConsumeResult, DailyRollResult, DrawState, PigProgress, RoastEvent
+from .models import CatalogSnapshot, CooldownConsumeResult, DailyRollResult, DrawState, PigProgress, RoastEvent
 
 
 class CloudStoreError(RuntimeError):
@@ -192,6 +192,7 @@ class CloudStore(RollpigStore):
         user_id: str,
         now_ts: Optional[float] = None,
         cooldown_seconds: Optional[int] = None,
+        max_charges: Optional[int] = None,
     ) -> CooldownConsumeResult:
         payload = await self._request(
             "POST",
@@ -200,11 +201,52 @@ class CloudStore(RollpigStore):
                 "user_id": user_id,
                 "now_ts": now_ts,
                 "cooldown_seconds": cooldown_seconds,
+                "max_charges": max_charges,
             },
         )
         return CooldownConsumeResult(
             allowed=bool(payload.get("allowed")),
             remaining_seconds=int(payload.get("remaining_seconds", 0)),
+            charges_left=int(payload.get("charges_left", 0)),
+            max_charges=int(payload.get("max_charges", max_charges or 1)),
+            next_recover_seconds=int(payload.get("next_recover_seconds", payload.get("remaining_seconds", 0))),
+        )
+
+    async def get_catalog_snapshot(self, user_id: str, days: int = 14) -> CatalogSnapshot:
+        payload = await self._request(
+            "GET",
+            "/v1/catalog-snapshot",
+            params={"user_id": user_id, "days": days},
+            fallback={"pig_ids": [], "progress": {}, "duplicate_streak": 0, "recent_rolls": [], "roasted_7d": 0},
+        )
+        progress_payload = payload.get("progress", {})
+        progress: dict[str, PigProgress] = {}
+        if isinstance(progress_payload, dict):
+            for pig_id, item in progress_payload.items():
+                if not isinstance(item, dict):
+                    continue
+                progress[str(pig_id)] = PigProgress(
+                    copies=int(item.get("copies") or 0),
+                    first_obtained_at=item.get("first_obtained_at"),
+                )
+
+        recent_rolls: dict[str, str] = {}
+        for item in payload.get("recent_rolls", []) or []:
+            if not isinstance(item, dict):
+                continue
+            date_str = str(item.get("date_str") or "")
+            pig_id = str(item.get("pig_id") or "")
+            if date_str and pig_id:
+                recent_rolls[date_str] = pig_id
+
+        return CatalogSnapshot(
+            draw_state=DrawState(
+                pig_ids=[str(item) for item in payload.get("pig_ids", []) or []],
+                progress=progress,
+                duplicate_streak=int(payload.get("duplicate_streak") or 0),
+            ),
+            recent_rolls=recent_rolls,
+            roasted_7d=int(payload.get("roasted_7d") or payload.get("roast_events_7d") or 0),
         )
 
     async def consume_force_usage(self, user_id: str, date_str: Optional[str] = None) -> bool:

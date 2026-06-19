@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import random
 import datetime
 import time
@@ -22,9 +22,16 @@ from nonebot_plugin_htmlrender import template_to_pic
 
 # 本地模块（在 require() 之后 import）
 from .config import Config
+from .catalog_renderer import render_catalog_image, shutdown_catalog_renderer
+from .perf_logging import log_perf
 from .roast_manager import roast_manager
 from .resource_manager import pig_resource_manager
-from .runtime import is_daily_summary_enabled, is_group_rollpig_enabled, resolve_roast_cooldown_seconds
+from .runtime import (
+    is_daily_summary_enabled,
+    is_group_rollpig_enabled,
+    resolve_roast_charge_max,
+    resolve_roast_cooldown_seconds,
+)
 from .store import store
 from .store.cloud import CloudStoreError
 from .store.models import DailyRollResult, DrawState, RoastEvent
@@ -79,6 +86,7 @@ __plugin_meta__ = PluginMetadata(
     
     📊 统计指令：
     我的猪圈 - 查看解锁进度
+    小猪图鉴 - 生成图片版小猪图鉴
     本周小猪 - 生成本周猪猪总结长图
     """,
     type="application",
@@ -86,6 +94,11 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"~onebot.v11"},
     config=Config,
 )
+
+
+@get_driver().on_shutdown
+async def _shutdown_catalog_renderer() -> None:
+    await shutdown_catalog_renderer()
 
 # ================= 资源路径 =================
 
@@ -224,7 +237,7 @@ def build_roll_growth_text(result: DailyRollResult, pig_data: dict) -> str:
 
 
 def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pigs: int) -> str:
-    """生成 P1A 版猪圈摘要；完整图鉴图片留到后续 P1.5。"""
+    """生成文本版猪圈摘要；图片版图鉴由“小猪图鉴”命令独立提供。"""
     user_count = len(draw_state.pig_ids)
     percent = int((user_count / total_pigs) * 100) if total_pigs > 0 else 0
 
@@ -265,7 +278,7 @@ def build_pigsty_growth_summary(user_name: str, draw_state: DrawState, total_pig
     else:
         streak_line = "🔥 连续重复：0 次（下一只从平常心开始）"
 
-    footer_line = "发送「今日小猪」开始收集。" if user_count <= 0 else "完整图鉴图还在施工，先把成长进度记牢。"
+    footer_line = "发送「今日小猪」开始收集。" if user_count <= 0 else "发送「小猪图鉴」查看图片版完整图鉴。"
 
     return (
         f"【我的猪圈统计】\n"
@@ -416,7 +429,7 @@ def format_cooldown_message(remaining_seconds: int) -> str:
     minutes, seconds = divmod(remaining, 60)
     hours, minutes = divmod(minutes, 60)
     time_str = f"{hours}小时{minutes}分" if hours > 0 else f"{minutes}分{seconds}秒"
-    return f"技能冷却中！还需要休息 {time_str} 才能再次烧烤。"
+    return f"烧烤充能恢复中！还需要 {time_str} 恢复 1 次。"
 
 
 # ================================ 群开关守卫 ================================ #
@@ -517,15 +530,18 @@ def build_pighub_image_url(pig_item: dict) -> Optional[str]:
 # ================= 辅助渲染函数 =================
 
 async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""):
+    started_at = time.perf_counter()
     pig_id = pig_data.get("id", "")
     avatar_file = find_image_file(pig_id)
     avatar_uri = avatar_file.as_uri() if avatar_file else ""
     name = pig_data.get("name", "未知小猪")
     desc = pig_data.get("description", "")
     analysis = pig_data.get("analysis", "你今天是只神秘小猪。")
+    payload_ready_at = time.perf_counter()
 
     pic = None
     try:
+        render_started_at = time.perf_counter()
         pic = await template_to_pic(
             template_path=RES_DIR,
             template_name="template.html",
@@ -536,6 +552,7 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
                 "analysis": analysis,
             },
         )
+        render_finished_at = time.perf_counter()
     except Exception as e:
         logger.error(f"图片渲染失败: pig_id={pig_id}, error={e}")
         await matcher.finish("图片生成失败。")
@@ -545,6 +562,16 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
     if extra_text:
         msg += extra_text + "\n"
     msg += MessageSegment.image(pic)
+    ready_to_send_at = time.perf_counter()
+    log_perf(
+        f"rollpig card rendered: pig_id={pig_id} name={name} "
+        f"image_found={avatar_file is not None} "
+        f"payload={payload_ready_at - started_at:.2f}s "
+        f"screenshot={render_finished_at - render_started_at:.2f}s "
+        f"message={ready_to_send_at - render_finished_at:.2f}s "
+        f"total_before_send={ready_to_send_at - started_at:.2f}s "
+        f"bytes={len(pic)} extra={bool(extra_text)}"
+    )
     await matcher.finish(msg)
 
 
@@ -981,6 +1008,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
         cooldown_result = await store.consume_roast_cooldown(
             attacker_id,
             cooldown_seconds=resolve_roast_cooldown_seconds(),
+            max_charges=resolve_roast_charge_max(),
         )
         if not cooldown_result.allowed:
             await cmd_roast_member.finish(
@@ -1164,6 +1192,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
     cooldown_result = await store.consume_roast_cooldown(
         attacker_id,
         cooldown_seconds=resolve_roast_cooldown_seconds(),
+        max_charges=resolve_roast_charge_max(),
     )
     if not cooldown_result.allowed:
         await cmd_random_roast.finish(
@@ -1346,6 +1375,63 @@ async def _(event: Event):
         total_pigs,
     )
     await cmd_sty.finish(MessageSegment.reply(event.message_id) + msg)
+
+
+# 6.5 图片版小猪图鉴
+cmd_catalog = on_command("小猪图鉴", aliases={"猪猪图鉴", "完整图鉴"}, block=True)
+
+
+@cmd_catalog.handle()
+@guard_group_enabled(cmd_catalog)
+@guard_store_errors(cmd_catalog)
+async def _(event: Event, args: Message = CommandArg()):
+    plugin_config = get_plugin_config(Config)
+    if not plugin_config.rollpig_catalog_enabled:
+        await cmd_catalog.finish(MessageSegment.reply(event.message_id) + "图片版小猪图鉴当前未启用。")
+        return
+
+    raw_arg = args.extract_plain_text().strip()
+    page = 1
+    if raw_arg:
+        try:
+            page = max(1, int(raw_arg.split()[0]))
+        except ValueError:
+            await cmd_catalog.finish(MessageSegment.reply(event.message_id) + "页码需要是数字，例如：小猪图鉴 2")
+            return
+
+    user_id = str(event.user_id)
+    if not PIG_LIST:
+        await cmd_catalog.finish(MessageSegment.reply(event.message_id) + "猪图鉴为空，请先检查资源文件。")
+        return
+
+    command_started_at = time.perf_counter()
+    snapshot_started_at = time.perf_counter()
+    snapshot = await store.get_catalog_snapshot(user_id, days=14)
+    snapshot_ready_at = time.perf_counter()
+    if not snapshot.draw_state.pig_ids:
+        await cmd_catalog.finish(MessageSegment.reply(event.message_id) + "你的猪圈空空如也！发送「今日小猪」开始收集。")
+        return
+
+    try:
+        pic = await render_catalog_image(
+            user_name=get_event_user_name(event),
+            snapshot=snapshot,
+            page=page,
+        )
+        render_ready_at = time.perf_counter()
+    except Exception as error:
+        logger.error(f"小猪图鉴渲染失败: user={user_id} page={page} error={error}")
+        await cmd_catalog.finish(MessageSegment.reply(event.message_id) + "小猪图鉴生成失败，请稍后再试。")
+        return
+
+    log_perf(
+        f"rollpig catalog command ready: user={user_id} page={page} "
+        f"snapshot={snapshot_ready_at - snapshot_started_at:.2f}s "
+        f"render={render_ready_at - snapshot_ready_at:.2f}s "
+        f"total_before_send={render_ready_at - command_started_at:.2f}s "
+        f"bytes={len(pic)}"
+    )
+    await cmd_catalog.finish(MessageSegment.reply(event.message_id) + MessageSegment.image(pic))
 
 
 # 7. 本周小猪
