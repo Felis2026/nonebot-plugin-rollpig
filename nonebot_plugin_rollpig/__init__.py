@@ -6,6 +6,7 @@ from functools import wraps
 import httpx
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from nonebot import on_command, require, get_driver, get_bot, get_plugin_config
 from nonebot.adapters.onebot.v11 import Event, MessageSegment, Message, GroupMessageEvent, Bot
@@ -105,6 +106,11 @@ async def _shutdown_catalog_renderer() -> None:
 PLUGIN_DIR = Path(__file__).parent
 RES_DIR = PLUGIN_DIR / "resource"
 PIGHUB_IMAGE_BASE_URL = "https://pighub.top/data/"
+PIGHUB_ORIGIN = "https://pighub.top/"
+PIGHUB_API_URLS = (
+    "https://pighub.top/api/images?sort=2",
+    "https://pighub.top/api/all-images",
+)
 PIGHUB_TTL_SECONDS = 6 * 3600  # PigHub 图库缓存有效期（6小时）
 MAX_EXPERT_LEVEL = 5
 DUPLICATE_PITY_WEIGHT_STEP = 0.5
@@ -483,6 +489,46 @@ def guard_store_errors(matcher, message: str = "猪圈云账本暂时离线，�
     return decorator
 
 
+def normalize_pighub_image_item(item: dict) -> Optional[dict]:
+    """把 PigHub 新旧 API 条目归一成命令层使用的 title/thumbnail/filename 格式。"""
+    if not isinstance(item, dict):
+        return None
+
+    # PigHub 旧接口使用 thumbnail，新接口使用 image_url；命令层继续读 thumbnail。
+    thumbnail = item.get("thumbnail") or item.get("image_url")
+    if not isinstance(thumbnail, str) or not thumbnail:
+        return None
+
+    title = item.get("title")
+    filename = item.get("filename") or thumbnail.split("/")[-1]
+    normalized = dict(item)
+    normalized["thumbnail"] = thumbnail
+    normalized["title"] = str(title or filename or "未命名小猪")
+    normalized["filename"] = str(filename or "")
+    return normalized
+
+
+def parse_pighub_images_payload(data: dict, api_url: str) -> list[dict]:
+    """解析 PigHub 新旧 API 返回值，并过滤掉缺少图片地址的异常条目。"""
+    if not isinstance(data, dict):
+        raise ValueError(f"PigHub 返回结构异常（{api_url}）：不是 JSON 对象")
+
+    # 新接口：/api/images?sort=2 -> {"code": 0, "message": "OK", "data": [...]}
+    # 旧接口：/api/all-images -> {"images": [...]}
+    raw_items = data.get("data") if isinstance(data.get("data"), list) else data.get("images")
+    if not isinstance(raw_items, list):
+        raise ValueError(f"PigHub 返回结构异常（{api_url}）：缺少 data/images 列表")
+
+    valid = []
+    for item in raw_items:
+        normalized = normalize_pighub_image_item(item)
+        if normalized:
+            valid.append(normalized)
+    if not valid:
+        raise ValueError(f"PigHub 返回空图集（{api_url}）")
+    return valid
+
+
 async def ensure_pighub_images_loaded() -> bool:
     """
     懒加载 PigHub 图库，带 TTL（默认6小时）自动刷新。
@@ -495,37 +541,57 @@ async def ensure_pighub_images_loaded() -> bool:
     if pighub_images and (now - pighub_last_loaded) < PIGHUB_TTL_SECONDS:
         return True
 
+    last_error: Exception | None = None
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get("https://pighub.top/api/all-images")
-            resp.raise_for_status()
-            data = resp.json()
+            for api_url in PIGHUB_API_URLS:
+                try:
+                    resp = await client.get(api_url)
+                    resp.raise_for_status()
+                    pighub_images = parse_pighub_images_payload(resp.json(), api_url)
+                    pighub_last_loaded = now
+                    return True
+                except Exception as error:
+                    # PigHub 当前新旧接口有切换历史；单个接口失败时继续尝试下一个。
+                    last_error = error
+                    logger.warning(f"PigHub 接口刷新失败，尝试备用接口：url={api_url}, error={error}")
+    except Exception as error:
+        last_error = error
 
-        if not isinstance(data, dict) or not isinstance(data.get("images"), list):
-            raise ValueError("PigHub 返回结构异常，缺少 images 列表")
-
-        valid = [item for item in data["images"] if isinstance(item, dict) and item.get("thumbnail")]
-        if not valid:
-            raise ValueError("PigHub 返回空图集")
-
-        pighub_images = valid
-        pighub_last_loaded = now
-        return True
-
-    except Exception as e:
+    if last_error:
         if pighub_images:
             # 刷新失败但有旧缓存：继续使用，不打挂功能
-            logger.warning(f"PigHub 刷新失败，继续使用旧缓存（{len(pighub_images)} 张）: {e}")
+            logger.warning(f"PigHub 刷新失败，继续使用旧缓存（{len(pighub_images)} 张）: {last_error}")
             return True
-        logger.warning(f"PigHub 连接失败: {e}")
-        return False
+        logger.warning(f"PigHub 连接失败: {last_error}")
+    return False
 
 
 def build_pighub_image_url(pig_item: dict) -> Optional[str]:
     thumbnail = pig_item.get("thumbnail")
     if not isinstance(thumbnail, str) or not thumbnail:
         return None
-    return PIGHUB_IMAGE_BASE_URL + thumbnail.split("/")[-1]
+
+    # 新接口返回 /images/xxx 或完整 URL；旧接口可能只有文件名或 /data/xxx。
+    if thumbnail.startswith(("http://", "https://")):
+        image_url = thumbnail
+    elif thumbnail.startswith("/"):
+        image_url = urljoin(PIGHUB_ORIGIN, thumbnail)
+    else:
+        image_url = PIGHUB_IMAGE_BASE_URL + thumbnail.split("/")[-1]
+
+    # 中文文件名和 emoji 需要百分号编码，避免部分发送端/下载端无法识别 URL。
+    parsed = urlsplit(image_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, quote(parsed.path, safe="/%"), parsed.query, parsed.fragment))
+
+
+def match_pighub_keyword(pig_item: dict, keyword: str) -> bool:
+    """按 PigHub 前端的搜索习惯，同时匹配标题和文件名。"""
+    lowered = keyword.lower()
+    return any(
+        lowered in str(pig_item.get(field, "")).lower()
+        for field in ("title", "filename")
+    )
 
 # ================= 辅助渲染函数 =================
 
@@ -723,7 +789,7 @@ async def _(bot: Bot, event: Event, args: Message = CommandArg()):
         await cmd_find.finish("请加上关键词，如：/找猪 玩偶")
         return
 
-    found_pigs = [pig for pig in pighub_images if keyword.lower() in pig.get("title", "").lower()]
+    found_pigs = [pig for pig in pighub_images if match_pighub_keyword(pig, keyword)]
     if not found_pigs:
         await cmd_find.finish(f"没找到叫「{keyword}」的猪。")
         return

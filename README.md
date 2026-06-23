@@ -21,7 +21,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@feli
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7.0"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7.1"
 
 ```
 
@@ -219,6 +219,25 @@ nonebot_plugin_rollpig/
 * 新增小猪时只需在 `pig.json` 添加对象，并将对应图片放到 `image/` 文件夹即可 🐷
 * 图片自动按 id 匹配，无需在 JSON 中写图片后缀 🐖
 
+---
+
+### 🔗 相关项目 🔗
+
+- 原作插件：[Bearlele/nonebot-plugin-rollpig](https://github.com/Bearlele/nonebot-plugin-rollpig)
+- 小猪资源包：[Felis2026/rollpig-resources](https://github.com/Felis2026/rollpig-resources)
+- 云端存储服务：[Felis2026/rollpig-cloud](https://github.com/Felis2026/rollpig-cloud)
+- PigHub（搜猪功能支持）：[pighub.top](https://pighub.top/)
+
+
+## v0.7.1 更新日志
+
+### 🔎 PigHub 兼容性修复
+- 兼容 PigHub 新版 `/api/images?sort=2` 图片列表接口，并保留旧 `/api/all-images` 接口兜底
+- 修复 PigHub API 变更导致 `随机小猪` / `找猪` 失效的问题
+- `找猪` 搜索扩展为同时匹配图片标题与文件名
+- 图片链接支持 `/images/...`、完整 URL、中文文件名与 emoji 文件名
+
+---
 
 ## v0.7.0 更新日志
 
