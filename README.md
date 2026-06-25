@@ -14,7 +14,7 @@
 使用 pip 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@felis-dev"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@main"
 
 ```
 
