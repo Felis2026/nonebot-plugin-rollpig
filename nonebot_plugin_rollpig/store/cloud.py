@@ -31,6 +31,18 @@ class CloudStore(RollpigStore):
             "Authorization": f"Bearer {config.rollpig_cloud_token}",
             "Content-Type": "application/json",
         }
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers=self.headers,
+            timeout=self.timeout,
+            # CloudStore 是高频路径：复用连接池能减少 TCP/TLS 开销，同时用上限避免异常并发撑爆连接。
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+    async def close(self) -> None:
+        """NoneBot 关闭时释放长期 HTTP client，避免 reload/退出时留下连接资源。"""
+        if not self._client.is_closed:
+            await self._client.aclose()
 
     async def _request(
         self,
@@ -45,14 +57,12 @@ class CloudStore(RollpigStore):
         normalized_params = {key: value for key, value in (params or {}).items() if value is not None}
         normalized_json = {key: value for key, value in (json_body or {}).items() if value is not None}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=self.headers,
-                    params=normalized_params,
-                    json=normalized_json,
-                )
+            response = await self._client.request(
+                method,
+                path,
+                params=normalized_params,
+                json=normalized_json,
+            )
             response.raise_for_status()
             if response.content:
                 return response.json()

@@ -7,6 +7,10 @@ from .models import CatalogSnapshot, CooldownConsumeResult, DailyRollResult, Dra
 
 
 class RollpigStore(ABC):
+    async def close(self) -> None:
+        """释放后端持有的连接或句柄；本地 JSON 后端没有常驻资源，默认无需处理。"""
+        return None
+
     @abstractmethod
     async def get_daily_roll(self, user_id: str, date_str: Optional[str] = None) -> Optional[str]:
         raise NotImplementedError

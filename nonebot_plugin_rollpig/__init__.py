@@ -99,8 +99,10 @@ __plugin_meta__ = PluginMetadata(
 
 
 @get_driver().on_shutdown
-async def _shutdown_catalog_renderer() -> None:
+async def _shutdown_rollpig_runtime() -> None:
+    """释放图鉴页面池与存储后端连接，避免长期运行或重载后残留浏览器/HTTP 资源。"""
     await shutdown_catalog_renderer()
+    await store.close()
 
 # ================= 资源路径 =================
 

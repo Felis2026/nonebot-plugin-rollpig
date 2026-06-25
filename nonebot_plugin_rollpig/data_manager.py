@@ -232,12 +232,9 @@ class PigDataManager:
         tmp.replace(self.file)
 
     async def _atomic_save(self):
-        """异步原子写：写入临时文件再原子替换，防止写入中途崩溃导致 JSON 损坏。"""
-        self._ensure_writable()
-        tmp = self.file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._rotate_backups()
-        tmp.replace(self.file)  # 同一文件系统上是原子操作（Windows/Linux 均支持）
+        """异步原子写：把 JSON 序列化和磁盘 IO 放到线程，避免阻塞 NoneBot 事件循环。"""
+        # 调用方仍在 self._lock 临界区内等待写入完成；这里只是把同步文件 IO 挪出事件循环。
+        await asyncio.to_thread(self._sync_save)
 
     def _ensure_writable(self):
         if self._load_failed:
