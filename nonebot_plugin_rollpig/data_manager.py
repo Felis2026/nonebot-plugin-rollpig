@@ -9,7 +9,7 @@ from typing import List, Optional
 from nonebot.log import logger
 import nonebot_plugin_localstore as store
 
-from .runtime import resolve_roast_cooldown_seconds
+from .runtime import rollpig_date_str, rollpig_today, resolve_roast_cooldown_seconds
 from .store.models import CatalogSnapshot, CooldownConsumeResult, DailyRollResult, DrawState, PigProgress
 
 ROAST_COOLDOWN_SECONDS = resolve_roast_cooldown_seconds()
@@ -288,11 +288,11 @@ class PigDataManager:
 
     def get_today_pig(self, user_id: str, date_str: Optional[str] = None) -> Optional[str]:
         """返回今日已抽的 pig_id，未抽返回 None。"""
-        target_date = date_str or datetime.date.today().isoformat()
+        target_date = date_str or rollpig_date_str()
         return self.data["history"].get(target_date, {}).get(user_id)
 
     def get_daily_rolls(self, date_str: Optional[str] = None) -> dict:
-        target_date = date_str or datetime.date.today().isoformat()
+        target_date = date_str or rollpig_date_str()
         return dict(self.data.get("history", {}).get(target_date, {}))
 
     def _record_group_roll(self, date_str: str, group_id: str, user_id: str, pig_id: str):
@@ -414,7 +414,7 @@ class PigDataManager:
     async def set_today_pig(self, user_id: str, pig_id: str, group_id: str = ""):
         """记录今日抽到的 pig_id，并同步将其写入图鉴（永久保留）。"""
         async with self._lock:
-            today = datetime.date.today().isoformat()
+            today = rollpig_date_str()
             if today not in self.data["history"]:
                 self.data["history"][today] = {}
             previous_pig_id = self.data["history"][today].get(user_id)
@@ -432,7 +432,7 @@ class PigDataManager:
         date_str: Optional[str] = None,
         group_id: str = "",
     ) -> DailyRollResult:
-        target_date = date_str or datetime.date.today().isoformat()
+        target_date = date_str or rollpig_date_str()
         async with self._lock:
             history = self.data.setdefault("history", {})
             day_history = history.setdefault(target_date, {})
@@ -471,7 +471,7 @@ class PigDataManager:
         if not group_id:
             return
         async with self._lock:
-            target_date = date_str or datetime.date.today().isoformat()
+            target_date = date_str or rollpig_date_str()
             self._record_group_roll(target_date, group_id, user_id, pig_id)
             await self._atomic_save()
 
@@ -485,7 +485,7 @@ class PigDataManager:
     async def clean_old_history(self, days_to_keep: int = 14):
         """清理超过 days_to_keep 天的历史记录（不影响图鉴数据）。"""
         async with self._lock:
-            today = datetime.date.today()
+            today = rollpig_today()
             history_dates_to_del = [
                 d for d in self.data["history"]
                 if _is_valid_date(d)  # 必须先过滤非法日期键，再做计算（防止 ValueError）
@@ -603,13 +603,13 @@ class PigDataManager:
 
     def check_force_roast_usage(self, user_id: str) -> bool:
         """普通用户后门：每日仅 1 次，返回今日是否仍可用。"""
-        today = datetime.date.today().isoformat()
+        today = rollpig_date_str()
         if "force_usage" not in self.data or not isinstance(self.data["force_usage"], dict):
             self.data["force_usage"] = {}
         return self.data["force_usage"].get(user_id) != today
 
     async def consume_force_roast_usage(self, user_id: str, date_str: Optional[str] = None) -> bool:
-        target_date = date_str or datetime.date.today().isoformat()
+        target_date = date_str or rollpig_date_str()
         async with self._lock:
             usage = self.data.setdefault("force_usage", {})
             if usage.get(user_id) == target_date:
@@ -620,7 +620,7 @@ class PigDataManager:
 
     async def update_force_roast_usage(self, user_id: str):
         async with self._lock:
-            today = datetime.date.today().isoformat()
+            today = rollpig_date_str()
             self.data.setdefault("force_usage", {})[user_id] = today
             await self._atomic_save()
 
@@ -634,7 +634,7 @@ class PigDataManager:
         event_type: "success" / "escape" / "backfire" / "bot_backfire" / "self_roast"
         """
         async with self._lock:
-            today = datetime.date.today().isoformat()
+            today = rollpig_date_str()
             events = self.data.setdefault("daily_events", {})
             day_events = events.setdefault(today, [])
             day_events.append({
@@ -651,7 +651,7 @@ class PigDataManager:
     def get_daily_events(self, date_str: Optional[str] = None, group_id: Optional[str] = None) -> list:
         """获取指定日期（默认今天）的所有烤群友事件。"""
         if not date_str:
-            date_str = datetime.date.today().isoformat()
+            date_str = rollpig_date_str()
         events = self.data.get("daily_events", {}).get(date_str, [])
         if not group_id:
             return events
@@ -659,7 +659,7 @@ class PigDataManager:
 
     def get_recent_rolls(self, user_id: str, days: int = 14) -> dict[str, str]:
         """返回最近若干天的抽猪记录；图鉴只读使用，不会修改 copies。"""
-        today = datetime.date.today()
+        today = rollpig_today()
         safe_days = max(1, min(60, int(days or 14)))
         start_date = today - datetime.timedelta(days=safe_days - 1)
         result: dict[str, str] = {}
@@ -675,7 +675,7 @@ class PigDataManager:
 
     def count_success_roasted(self, user_id: str, days: int = 7) -> int:
         """统计用户近 N 天成功被烤次数；逃脱/反噬不算“被烤成功”。"""
-        today = datetime.date.today()
+        today = rollpig_today()
         safe_days = max(1, min(60, int(days or 7)))
         start_date = today - datetime.timedelta(days=safe_days - 1)
         total = 0
@@ -705,13 +705,13 @@ class PigDataManager:
     def get_group_rolls(self, group_id: str, date_str: Optional[str] = None) -> dict:
         """获取指定群在某天登记过的今日形态。"""
         if not date_str:
-            date_str = datetime.date.today().isoformat()
+            date_str = rollpig_date_str()
         return self.data.get("group_rolls", {}).get(date_str, {}).get(group_id, {})
 
     def get_active_group_ids(self, date_str: Optional[str] = None) -> set[str]:
         """获取指定日期内有抽猪或烧烤活动的群号集合。"""
         if not date_str:
-            date_str = datetime.date.today().isoformat()
+            date_str = rollpig_date_str()
 
         event_groups = {
             str(e.get("group_id"))
@@ -802,7 +802,7 @@ class PigDataManager:
         """从 history 中统计今日抽猪信息。"""
         from collections import Counter
         if not date_str:
-            date_str = datetime.date.today().isoformat()
+            date_str = rollpig_date_str()
         if group_id:
             today_rolls = self.get_group_rolls(group_id, date_str)
         else:
@@ -827,7 +827,7 @@ class PigDataManager:
 
     def is_protected(self, group_id: str, user_id: str, date_str: Optional[str] = None) -> bool:
         """检查用户在当前群今日是否受保护。"""
-        target_date = date_str or datetime.date.today().isoformat()
+        target_date = date_str or rollpig_date_str()
         protected_map = self.data.get("protected", {}).get(target_date, {})
         if not isinstance(protected_map, dict):
             return False
@@ -842,7 +842,7 @@ class PigDataManager:
         protect_date: Optional[str] = None,
     ):
         """按群设置某日受保护的用户列表。"""
-        target_date = protect_date or (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        target_date = protect_date or rollpig_date_str(1)
         async with self._lock:
             protected = self.data.setdefault("protected", {})
             day_map = protected.setdefault(target_date, {})
@@ -851,7 +851,7 @@ class PigDataManager:
 
     async def set_protected_users(self, user_ids: list):
         """兼容旧接口：写入 legacy 全局保护名单。"""
-        target_date = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        target_date = rollpig_date_str(1)
         async with self._lock:
             protected = self.data.setdefault("protected", {})
             day_map = protected.setdefault(target_date, {})
@@ -861,7 +861,7 @@ class PigDataManager:
     async def clean_old_events(self, days_to_keep: int = 7):
         """清理超过 days_to_keep 天的事件记录。"""
         async with self._lock:
-            today = datetime.date.today()
+            today = rollpig_today()
             events = self.data.get("daily_events", {})
             dates_to_del = [
                 d for d in events

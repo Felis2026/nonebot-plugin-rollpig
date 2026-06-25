@@ -65,6 +65,10 @@ class Config(BaseModel):
     rollpig_deepseek_key: Optional[str] = None  # DeepSeek API Key
     rollpig_deepseek_base: str = "https://api.deepseek.com" # Base URL
     rollpig_model: str = "deepseek-chat" # 模型名称
+    rollpig_ai_timeout: float = 20.0  # 单次 AI 生成超时时间（秒）
+    rollpig_ai_concurrency: int = 4  # AI 文案生成并发上限
+    rollpig_ai_max_tokens: int = 4096  # AI 单次响应 token 上限
+    rollpig_ai_output_max_chars: int = 240  # AI 文案入库前的最大字符数
     rollpig_roast_cooldown_hours: float = 8.0  # 烤群友普通模式冷却时长（小时）
     rollpig_roast_charge_max: int = 2  # 普通烤群友最多可储存次数
     rollpig_storage_backend: str = "local"  # local / cloud

@@ -31,6 +31,8 @@ from .resource_manager import pig_resource_manager
 from .runtime import (
     is_daily_summary_enabled,
     is_group_rollpig_enabled,
+    rollpig_date_str,
+    rollpig_today,
     resolve_roast_charge_max,
     resolve_roast_cooldown_seconds,
 )
@@ -416,7 +418,7 @@ def get_event_user_name(event: Event) -> str:
 
 async def get_group_roll_candidates(bot: Bot, group_id: int, exclude_ids: set[str]) -> list[str]:
     """优先按当前群成员范围筛候选；接口异常时回退到群内已登记过的今日形态。"""
-    today = datetime.date.today().isoformat()
+    today = rollpig_date_str()
     today_rolls = await store.get_daily_rolls(today)
 
     try:
@@ -848,7 +850,7 @@ cmd_yest = on_command("昨日小猪", block=True)
 @guard_store_errors(cmd_yest)
 async def _(event: Event):
     user_id = str(event.user_id)
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    yesterday = rollpig_date_str(-1)
     pig = get_pig_by_id(await store.get_pig_by_date(user_id, yesterday))
 
     if not pig:
@@ -1513,7 +1515,7 @@ async def _(event: Event):
         await cmd_week.finish("Bot 未安装 PIL 库。")
 
     user_id = str(event.user_id)
-    today = datetime.date.today()
+    today = rollpig_today()
 
     images_to_merge = []
     for i in range(7):
@@ -1676,7 +1678,7 @@ async def daily_summary_job():
             return
 
         group_summaries = {}
-        protect_date = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        protect_date = rollpig_date_str(1)
         for group_id in enabled_active_groups:
             summary = await build_daily_summary(store, group_id=group_id)
             group_summaries[group_id] = summary

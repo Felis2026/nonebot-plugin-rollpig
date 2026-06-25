@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime
 from typing import Optional
 
 import httpx
@@ -8,6 +7,7 @@ from nonebot import get_plugin_config
 from nonebot.log import logger
 
 from ..config import Config
+from ..runtime import rollpig_date_str
 from .base import RollpigStore
 from .models import CatalogSnapshot, CooldownConsumeResult, DailyRollResult, DrawState, PigProgress, RoastEvent
 
@@ -77,7 +77,7 @@ class CloudStore(RollpigStore):
         payload = await self._request(
             "GET",
             "/v1/daily-rolls/by-date",
-            params={"user_id": user_id, "date_str": date_str or datetime.date.today().isoformat()},
+            params={"user_id": user_id, "date_str": date_str or rollpig_date_str()},
             fallback={"pig_id": None},
         )
         return payload.get("pig_id") if payload else None
@@ -86,7 +86,7 @@ class CloudStore(RollpigStore):
         payload = await self._request(
             "GET",
             "/v1/daily-rolls/all",
-            params={"date_str": date_str or datetime.date.today().isoformat()},
+            params={"date_str": date_str or rollpig_date_str()},
             fallback={"items": []},
         )
         items = payload.get("items", []) if payload else []
@@ -109,7 +109,7 @@ class CloudStore(RollpigStore):
             json_body={
                 "user_id": user_id,
                 "proposed_pig_id": proposed_pig_id,
-                "date_str": date_str or datetime.date.today().isoformat(),
+                "date_str": date_str or rollpig_date_str(),
                 "group_id": group_id,
             },
         )
@@ -161,7 +161,7 @@ class CloudStore(RollpigStore):
                 "group_id": group_id,
                 "user_id": user_id,
                 "pig_id": pig_id,
-                "date_str": date_str or datetime.date.today().isoformat(),
+                "date_str": date_str or rollpig_date_str(),
             },
         )
 
@@ -169,7 +169,7 @@ class CloudStore(RollpigStore):
         payload = await self._request(
             "GET",
             "/v1/group-rolls",
-            params={"group_id": group_id, "date_str": date_str or datetime.date.today().isoformat()},
+            params={"group_id": group_id, "date_str": date_str or rollpig_date_str()},
             fallback={"items": []},
         )
         items = payload.get("items", []) if payload else []
@@ -263,7 +263,7 @@ class CloudStore(RollpigStore):
         payload = await self._request(
             "POST",
             "/v1/cooldowns/consume-force",
-            json_body={"user_id": user_id, "date_str": date_str or datetime.date.today().isoformat()},
+            json_body={"user_id": user_id, "date_str": date_str or rollpig_date_str()},
         )
         return bool(payload.get("allowed"))
 
@@ -279,7 +279,7 @@ class CloudStore(RollpigStore):
                 "target_name": event.target_name,
                 "food": event.food,
                 "group_id": event.group_id,
-                "date_str": datetime.date.today().isoformat(),
+                "date_str": rollpig_date_str(),
             },
         )
 
@@ -287,7 +287,7 @@ class CloudStore(RollpigStore):
         payload = await self._request(
             "GET",
             "/v1/events",
-            params={"date_str": date_str or datetime.date.today().isoformat(), "group_id": group_id},
+            params={"date_str": date_str or rollpig_date_str(), "group_id": group_id},
             fallback={"items": []},
         )
         return payload.get("items", []) if payload else []
@@ -296,7 +296,7 @@ class CloudStore(RollpigStore):
         payload = await self._request(
             "GET",
             "/v1/groups/active",
-            params={"date_str": date_str or datetime.date.today().isoformat()},
+            params={"date_str": date_str or rollpig_date_str()},
             fallback={"group_ids": []},
         )
         return {str(group_id) for group_id in payload.get("group_ids", [])} if payload else set()
@@ -313,7 +313,7 @@ class CloudStore(RollpigStore):
             json_body={
                 "group_id": group_id,
                 "user_ids": user_ids,
-                "protect_date": protect_date or datetime.date.today().isoformat(),
+                "protect_date": protect_date or rollpig_date_str(1),
             },
         )
 
@@ -324,7 +324,7 @@ class CloudStore(RollpigStore):
             params={
                 "group_id": group_id,
                 "user_id": user_id,
-                "protect_date": date_str or datetime.date.today().isoformat(),
+                "protect_date": date_str or rollpig_date_str(),
             },
             fallback={"protected": False},
         )

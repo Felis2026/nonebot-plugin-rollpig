@@ -16,6 +16,19 @@ plugin_config = get_plugin_config(Config)
 # 数据文件
 ROAST_LIB_FILE = store.get_plugin_data_file("roast_library.json")
 
+
+def _clamp_number(value: object, default: float, minimum: float, maximum: float) -> float:
+    """把外部配置收敛到安全区间，避免极端值拖垮事件循环或 API 账单。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    return int(_clamp_number(value, default, minimum, maximum))
+
 # ================= 默认兜底文案模板 =================
 DEFAULT_TEMPLATES = [
     "你本是一只无忧无虑的【{origin}】，却没能逃过命运的安排，含泪变成了【{food}】。",
@@ -38,6 +51,12 @@ class RoastManager:
         self.library: Dict[str, Dict[str, List[str]]] = self._load()
         
         self.client = None
+        self.ai_timeout = _clamp_number(plugin_config.rollpig_ai_timeout, 20.0, 1.0, 60.0)
+        self.ai_max_tokens = _clamp_int(plugin_config.rollpig_ai_max_tokens, 4096, 64, 4096)
+        self.ai_output_max_chars = _clamp_int(plugin_config.rollpig_ai_output_max_chars, 240, 40, 600)
+        self._ai_semaphore = asyncio.Semaphore(
+            _clamp_int(plugin_config.rollpig_ai_concurrency, 4, 1, 6)
+        )
         # AI 只有在“开关开启 + key 存在”时才会启用。
         self.ai_ready = bool(plugin_config.rollpig_ai_enabled and plugin_config.rollpig_deepseek_key)
         if self.ai_ready:
@@ -173,18 +192,35 @@ class RoastManager:
             )
 
         try:
-            response = await self.client.chat.completions.create(
-                model=plugin_config.rollpig_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                stream=False
-            )
+            # OpenAI 兼容接口可能在网络抖动时长时间挂起；这里用本地超时和并发闸门
+            # 保护 NoneBot 事件循环，失败后由调用方回落本地模板。
+            async with self._ai_semaphore:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(
+                        model=plugin_config.rollpig_model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        stream=False,
+                        max_tokens=self.ai_max_tokens,
+                    ),
+                    timeout=self.ai_timeout,
+                )
+            usage = getattr(response, "usage", None)
+            if usage:
+                logger.info(
+                    "AI 烤猪 token 用量: "
+                    f"prompt={getattr(usage, 'prompt_tokens', None)} "
+                    f"completion={getattr(usage, 'completion_tokens', None)} "
+                    f"total={getattr(usage, 'total_tokens', None)} "
+                    f"max_tokens={self.ai_max_tokens}"
+                )
             content = response.choices[0].message.content
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("AI empty response")
-            return content.strip().strip('"').strip("'").replace("\n", "")
+            text = content.strip().strip('"').strip("'").replace("\n", "")
+            return text[: self.ai_output_max_chars]
         except Exception as e:
             logger.error(f"DeepSeek API 请求错误: {e}")
             raise e

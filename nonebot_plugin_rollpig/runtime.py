@@ -1,11 +1,39 @@
 from __future__ import annotations
 
+import datetime
 from typing import Callable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nonebot import get_plugin_config
 from nonebot.log import logger
 
 from .config import Config
+
+
+# ================================ 日期边界 ================================ #
+# RollPig 的“今天/明天/近 7 天”都按中国用户习惯使用 Asia/Shanghai。
+# 不直接调用 date.today()，避免服务器部署在 UTC 或其他时区时跨日边界漂移。
+try:
+    ROLLPIG_TIMEZONE = ZoneInfo("Asia/Shanghai")
+except ZoneInfoNotFoundError:
+    # Windows 精简环境可能缺少 IANA tzdata；中国业务日期当前无夏令时，
+    # 固定 UTC+8 兜底可以避免插件在导入阶段直接失败。
+    ROLLPIG_TIMEZONE = datetime.timezone(datetime.timedelta(hours=8), "Asia/Shanghai")
+
+
+def rollpig_now() -> datetime.datetime:
+    """返回 RollPig 业务时区下的当前时间。"""
+    return datetime.datetime.now(ROLLPIG_TIMEZONE)
+
+
+def rollpig_today() -> datetime.date:
+    """返回 RollPig 业务时区下的今天日期。"""
+    return rollpig_now().date()
+
+
+def rollpig_date_str(offset_days: int = 0) -> str:
+    """返回 RollPig 业务日期字符串；offset_days 用于昨日/明日等相对日期。"""
+    return (rollpig_today() + datetime.timedelta(days=offset_days)).isoformat()
 
 
 # ================================ 外部群开关适配 ================================ #

@@ -93,6 +93,10 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7
     // ================================ AI 烤猪 ================================ //
     "rollpig_ai_enabled": false,               // 是否启用 AI 烤猪；只填 Key 不会自动开启
     "rollpig_model": "deepseek-chat",          // AI 模型名称，默认 DeepSeek Chat
+    "rollpig_ai_timeout": 20.0,                // 单次 AI 文案生成超时时间（秒），超时自动回退本地模板
+    "rollpig_ai_concurrency": 4,               // AI 文案生成并发上限，避免多人同时烤猪时堆积请求
+    "rollpig_ai_max_tokens": 4096,             // AI 单次响应 token 上限，防止异常长输出
+    "rollpig_ai_output_max_chars": 240,        // AI 文案入库前最大字符数，避免过长文本撑爆消息
     "rollpig_roast_cooldown_hours": 8,         // 普通烤群友每恢复 1 次所需小时数
     "rollpig_roast_charge_max": 2,             // 普通烤群友最多可储存次数；后门/强行点火不消耗
 

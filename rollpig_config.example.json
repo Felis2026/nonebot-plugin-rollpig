@@ -2,6 +2,10 @@
   "rollpig": {
     "rollpig_ai_enabled": false,
     "rollpig_model": "deepseek-chat",
+    "rollpig_ai_timeout": 20.0,
+    "rollpig_ai_concurrency": 4,
+    "rollpig_ai_max_tokens": 4096,
+    "rollpig_ai_output_max_chars": 240,
     "rollpig_roast_cooldown_hours": 8,
     "rollpig_roast_charge_max": 2,
     "rollpig_storage_backend": "local",

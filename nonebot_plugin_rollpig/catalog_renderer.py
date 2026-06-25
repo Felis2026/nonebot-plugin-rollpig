@@ -20,6 +20,7 @@ from .config import Config
 from .perf_logging import log_perf
 from .render_budget import html_render_budget
 from .resource_manager import pig_resource_manager
+from .runtime import ROLLPIG_TIMEZONE, rollpig_today
 from .store.models import CatalogSnapshot, DrawState, PigProgress
 
 
@@ -32,6 +33,7 @@ CATALOG_SIZE = (1536, 1024)
 # 当前底图安全区按 38 张卡片精修，开放配置会让最后一行与装饰区重新漂移。
 CATALOG_PAGE_SIZE = 38
 CATALOG_CACHE_MAX_ENTRIES = 64
+CATALOG_CACHE_MAX_BYTES = 64 * 1024 * 1024
 MAX_EXPERT_LEVEL = 5
 NEW_BADGE_DAYS = 7
 
@@ -189,6 +191,10 @@ async def shutdown_catalog_renderer() -> None:
 
 # ================================ 图鉴结果缓存 ================================ #
 
+def _catalog_cache_bytes() -> int:
+    return sum(len(cached.payload) for cached in _catalog_cache.values())
+
+
 def _prune_catalog_cache(*, ttl: int, now: float) -> None:
     """清理图片结果缓存；TTL 控制新鲜度，硬上限防止多用户短时生成导致内存膨胀。"""
     if not _catalog_cache:
@@ -207,6 +213,12 @@ def _prune_catalog_cache(*, ttl: int, now: float) -> None:
 
     oldest_keys = sorted(_catalog_cache, key=lambda key: _catalog_cache[key].created_at)[:overflow]
     for key in oldest_keys:
+        _catalog_cache.pop(key, None)
+
+    # PNG 图鉴单张可达数 MB，仅限制条数不足以约束内存；总字节超限时继续按最老优先淘汰。
+    for key in sorted(_catalog_cache, key=lambda key: _catalog_cache[key].created_at):
+        if _catalog_cache_bytes() <= CATALOG_CACHE_MAX_BYTES:
+            break
         _catalog_cache.pop(key, None)
 
 
@@ -266,7 +278,9 @@ def _parse_datetime(value: str | None) -> dt.datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        # first_obtained_at 本地模式按 UTC 写入；NEW 徽章属于用户可见业务日期，
+        # 因此要先换算到 RollPig 日期边界再取 date。
+        parsed = parsed.astimezone(ROLLPIG_TIMEZONE).replace(tzinfo=None)
     return parsed
 
 
@@ -350,7 +364,7 @@ def _build_template_payload(
     snapshot: CatalogSnapshot,
     page: int,
 ) -> dict[str, Any]:
-    today = dt.date.today()
+    today = rollpig_today()
     page_size = CATALOG_PAGE_SIZE
     progress_items = _sort_progress_items(snapshot.draw_state)
     total_pigs = len(pig_resource_manager.pig_list)
@@ -511,4 +525,5 @@ async def render_catalog_image(
     )
     if ttl > 0:
         _catalog_cache[cache_key] = _CachedCatalogImage(created_at=time.time(), payload=result)
+        _prune_catalog_cache(ttl=ttl, now=time.time())
     return result
