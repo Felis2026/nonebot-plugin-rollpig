@@ -18,6 +18,7 @@ import nonebot_plugin_localstore as localstore
 
 from .config import Config
 from .perf_logging import log_perf
+from .render_budget import html_render_budget
 from .resource_manager import pig_resource_manager
 from .store.models import CatalogSnapshot, DrawState, PigProgress
 
@@ -494,7 +495,8 @@ async def render_catalog_image(
     timeout_ms = max(1000, int(float(config.rollpig_catalog_render_timeout or 8.0) * 1000))
     scale_factor = float(config.rollpig_catalog_scale_factor or 2.0)
     pool = _get_page_pool(int(config.rollpig_catalog_render_concurrency or 2), scale_factor)
-    page_result = await pool.render(html, timeout_ms=timeout_ms)
+    async with html_render_budget("catalog"):
+        page_result = await pool.render(html, timeout_ms=timeout_ms)
     postprocess_started_at = time.perf_counter()
     result = _resize_to_catalog_size(page_result.raw_image, output_format=output_format)
     finished_at = time.perf_counter()

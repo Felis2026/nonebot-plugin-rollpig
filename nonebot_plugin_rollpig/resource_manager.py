@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from nonebot import get_plugin_config
@@ -33,6 +35,12 @@ PRIVATE_STATE_FILE = CACHE_ROOT / "private_state.json"
 
 PIG_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_IMAGE_SUFFIXES = {".png"}
+RESOURCE_MANIFEST_MAX_SIZE = 1 * 1024 * 1024
+RESOURCE_PIG_JSON_MAX_SIZE = 2 * 1024 * 1024
+RESOURCE_RULES_JSON_MAX_SIZE = 256 * 1024
+RESOURCE_PACKAGE_MAX_SIZE = 128 * 1024 * 1024
+RESOURCE_MAX_IMAGES = 500
+RESOURCE_MAX_FILES = 700
 
 
 @dataclass
@@ -43,8 +51,27 @@ class ResourceSyncResult:
     message: str = ""
 
 
+@dataclass
+class _DownloadBudget:
+    """限制单次资源同步的总文件数和总字节数，避免异常 manifest 拖垮内存或磁盘。"""
+
+    max_total_size: int
+    max_file_count: int
+    total_size: int = 0
+    file_count: int = 0
+
+    def add_file(self, *, path: str, size: int) -> None:
+        self.file_count += 1
+        self.total_size += size
+        if self.file_count > self.max_file_count:
+            raise ValueError(f"资源包文件数量超过上限: {self.file_count}/{self.max_file_count}")
+        if self.total_size > self.max_total_size:
+            raise ValueError(f"资源包总大小超过上限: {path}")
+
+
 class RollPigResourceManager:
     def __init__(self) -> None:
+        self._sync_lock = asyncio.Lock()
         self.pig_list: list[dict[str, Any]] = []
         self.pig_map: dict[str, dict[str, Any]] = {}
         self.food_pig_ids: set[str] = set()
@@ -199,7 +226,42 @@ class RollPigResourceManager:
 
     # ================================ 云端同步 ================================ #
     # 同步流程采用“临时目录下载 -> 完整校验 -> 原子替换 active”的方式，避免半包覆盖。
+    async def sync_all(self, *, force: bool = False, wait_if_busy: bool = True) -> tuple[ResourceSyncResult, ResourceSyncResult]:
+        """串行同步公有包与私有 overlay；手动同步等待，后台同步可选择忙时跳过。"""
+        if not wait_if_busy and self._sync_lock.locked():
+            return (
+                ResourceSyncResult(updated=False, skipped=True, message="已有资源同步任务运行中"),
+                ResourceSyncResult(updated=False, skipped=True, message=""),
+        )
+        async with self._sync_lock:
+            public_result = await self._sync_from_remote_unlocked(force=force)
+            try:
+                private_result = await self._sync_private_from_remote_unlocked(force=force)
+            except Exception as error:
+                # 私有 overlay 是附加包：同步失败必须明确报告，但不能让已成功激活的公有包失效。
+                logger.warning(f"rollpig 私有资源同步失败，继续使用当前私有缓存: {error}")
+                private_result = ResourceSyncResult(updated=False, skipped=False, message=f"私有资源同步失败：{error}")
+            if public_result.updated or private_result.updated:
+                self.reload()
+            return public_result, private_result
+
     async def sync_from_remote(self, *, force: bool = False) -> ResourceSyncResult:
+        """兼容旧调用：单独同步公有包时也进入同一把锁。"""
+        async with self._sync_lock:
+            result = await self._sync_from_remote_unlocked(force=force)
+            if result.updated:
+                self.reload()
+            return result
+
+    async def sync_private_from_remote(self, *, force: bool = False) -> ResourceSyncResult:
+        """兼容旧调用：单独同步私有包时也进入同一把锁。"""
+        async with self._sync_lock:
+            result = await self._sync_private_from_remote_unlocked(force=force)
+            if result.updated:
+                self.reload()
+            return result
+
+    async def _sync_from_remote_unlocked(self, *, force: bool = False) -> ResourceSyncResult:
         config = get_plugin_config(Config)
         if not config.rollpig_resource_sync_enabled and not force:
             return ResourceSyncResult(updated=False, skipped=True, message="资源同步未启用")
@@ -209,8 +271,9 @@ class RollPigResourceManager:
             return ResourceSyncResult(updated=False, skipped=True, message="未配置资源 manifest URL")
 
         timeout = max(1.0, float(config.rollpig_resource_sync_timeout or 10.0))
+        max_file_size = max(1024, int(config.rollpig_resource_max_file_size or 10 * 1024 * 1024))
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            manifest = await self._download_json(client, manifest_url, max_size=int(config.rollpig_resource_max_file_size))
+            manifest = await self._download_json(client, manifest_url, max_size=RESOURCE_MANIFEST_MAX_SIZE)
 
             resource_version = str(manifest.get("resource_version") or "").strip()
             if not resource_version:
@@ -223,9 +286,7 @@ class RollPigResourceManager:
                     message="资源已是最新版本",
                 )
 
-            staging_dir = CACHE_ROOT / f".incoming_{int(time.time())}"
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir)
+            staging_dir = self._new_staging_dir("incoming")
             (staging_dir / "images").mkdir(parents=True, exist_ok=True)
 
             try:
@@ -234,7 +295,7 @@ class RollPigResourceManager:
                     manifest_url=manifest_url,
                     manifest=manifest,
                     staging_dir=staging_dir,
-                    max_size=int(config.rollpig_resource_max_file_size),
+                    max_size=max_file_size,
                 )
                 pig_list = self._read_pig_json(staging_dir / "pig.json")
                 self._ensure_images_exist(pig_list, [staging_dir / "images"])
@@ -244,7 +305,6 @@ class RollPigResourceManager:
                     shutil.rmtree(staging_dir)
                 raise
 
-        self.reload()
         return ResourceSyncResult(
             updated=True,
             skipped=False,
@@ -252,7 +312,7 @@ class RollPigResourceManager:
             message=f"资源同步完成：{resource_version}",
         )
 
-    async def sync_private_from_remote(self, *, force: bool = False) -> ResourceSyncResult:
+    async def _sync_private_from_remote_unlocked(self, *, force: bool = False) -> ResourceSyncResult:
         config = get_plugin_config(Config)
         manifest_url = self._resolve_private_manifest_url(config)
         if not manifest_url:
@@ -264,8 +324,9 @@ class RollPigResourceManager:
         if private_token:
             headers["Authorization"] = f"Bearer {private_token}"
 
+        max_file_size = max(1024, int(config.rollpig_resource_max_file_size or 10 * 1024 * 1024))
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-            manifest = await self._download_json(client, manifest_url, max_size=int(config.rollpig_resource_max_file_size))
+            manifest = await self._download_json(client, manifest_url, max_size=RESOURCE_MANIFEST_MAX_SIZE)
 
             if not bool(manifest.get("overlay")):
                 raise ValueError("私有资源 manifest 必须标记 overlay=true")
@@ -281,9 +342,7 @@ class RollPigResourceManager:
                     message="私有资源已是最新版本",
                 )
 
-            staging_dir = CACHE_ROOT / f".incoming_private_{int(time.time())}"
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir)
+            staging_dir = self._new_staging_dir("incoming_private")
             (staging_dir / "images").mkdir(parents=True, exist_ok=True)
 
             try:
@@ -292,7 +351,7 @@ class RollPigResourceManager:
                     manifest_url=manifest_url,
                     manifest=manifest,
                     staging_dir=staging_dir,
-                    max_size=int(config.rollpig_resource_max_file_size),
+                    max_size=max_file_size,
                 )
                 private_pigs = self._read_pig_json(staging_dir / "pig.json")
                 self._ensure_images_exist(private_pigs, [staging_dir / "images"])
@@ -302,7 +361,6 @@ class RollPigResourceManager:
                     shutil.rmtree(staging_dir)
                 raise
 
-        self.reload()
         return ResourceSyncResult(
             updated=True,
             skipped=False,
@@ -322,12 +380,14 @@ class RollPigResourceManager:
         pig_json_meta = manifest.get("pig_json")
         if not isinstance(pig_json_meta, dict):
             raise ValueError("manifest 缺少 pig_json")
+        budget = _DownloadBudget(max_total_size=RESOURCE_PACKAGE_MAX_SIZE, max_file_count=RESOURCE_MAX_FILES)
         await self._download_file_by_meta(
             client,
             manifest_url=manifest_url,
             meta=pig_json_meta,
             target=staging_dir / "pig.json",
-            max_size=max_size,
+            max_size=min(max_size, RESOURCE_PIG_JSON_MAX_SIZE),
+            budget=budget,
         )
 
         optional_files = manifest.get("optional_files") or {}
@@ -338,12 +398,15 @@ class RollPigResourceManager:
                 manifest_url=manifest_url,
                 meta=rules_meta,
                 target=staging_dir / "pig_rules.json",
-                max_size=max_size,
+                max_size=min(max_size, RESOURCE_RULES_JSON_MAX_SIZE),
+                budget=budget,
             )
 
         image_items = manifest.get("images")
         if not isinstance(image_items, list):
             raise ValueError("manifest 缺少 images 列表")
+        if len(image_items) > RESOURCE_MAX_IMAGES:
+            raise ValueError(f"manifest images 数量超过上限: {len(image_items)}/{RESOURCE_MAX_IMAGES}")
         for image_meta in image_items:
             if not isinstance(image_meta, dict):
                 raise ValueError("manifest images 存在非法条目")
@@ -355,6 +418,7 @@ class RollPigResourceManager:
                 meta=image_meta,
                 target=staging_dir / "images" / filename,
                 max_size=max_size,
+                budget=budget,
             )
 
     async def _download_private_manifest_files(
@@ -369,12 +433,14 @@ class RollPigResourceManager:
         pig_json_meta = manifest.get("pig_json")
         if not isinstance(pig_json_meta, dict):
             raise ValueError("私有资源 manifest 缺少 pig_json")
+        budget = _DownloadBudget(max_total_size=RESOURCE_PACKAGE_MAX_SIZE, max_file_count=RESOURCE_MAX_FILES)
         await self._download_file_by_meta(
             client,
             manifest_url=manifest_url,
             meta=pig_json_meta,
             target=staging_dir / "pig.json",
-            max_size=max_size,
+            max_size=min(max_size, RESOURCE_PIG_JSON_MAX_SIZE),
+            budget=budget,
         )
 
         optional_files = manifest.get("optional_files") or {}
@@ -388,12 +454,15 @@ class RollPigResourceManager:
                     manifest_url=manifest_url,
                     meta=file_meta,
                     target=staging_dir / filename,
-                    max_size=max_size,
+                    max_size=min(max_size, RESOURCE_RULES_JSON_MAX_SIZE),
+                    budget=budget,
                 )
 
         image_items = manifest.get("images") or []
         if not isinstance(image_items, list):
             raise ValueError("私有资源 manifest images 必须是 list")
+        if len(image_items) > RESOURCE_MAX_IMAGES:
+            raise ValueError(f"私有资源 images 数量超过上限: {len(image_items)}/{RESOURCE_MAX_IMAGES}")
         for image_meta in image_items:
             if not isinstance(image_meta, dict):
                 raise ValueError("私有资源 images 存在非法条目")
@@ -405,6 +474,7 @@ class RollPigResourceManager:
                 meta=image_meta,
                 target=staging_dir / "images" / filename,
                 max_size=max_size,
+                budget=budget,
             )
 
     async def _download_json(self, client: httpx.AsyncClient, url: str, *, max_size: int) -> dict[str, Any]:
@@ -422,72 +492,162 @@ class RollPigResourceManager:
         meta: dict[str, Any],
         target: Path,
         max_size: int,
+        budget: _DownloadBudget,
     ) -> None:
         path = str(meta.get("path") or meta.get("filename") or "").strip()
         if not path:
             raise ValueError("manifest 文件条目缺少 path")
-        url = urljoin(manifest_url, path)
-        content = await self._download_bytes(client, url, max_size=max_size)
+        self._validate_manifest_path(path)
 
         expected_size = meta.get("size")
-        if expected_size is not None and int(expected_size) != len(content):
-            raise ValueError(f"文件大小校验失败: {path}")
+        if expected_size is not None and int(expected_size) > max_size:
+            raise ValueError(f"文件超过大小上限: {path}")
 
-        expected_hash = str(meta.get("sha256") or "").lower()
-        actual_hash = hashlib.sha256(content).hexdigest()
-        if expected_hash and actual_hash != expected_hash:
-            raise ValueError(f"sha256 校验失败: {path}")
+        url = urljoin(manifest_url, path)
+        size, actual_hash, tmp = await self._download_file_to_temp(client, url, target, max_size=max_size)
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+        try:
+            if expected_size is not None and int(expected_size) != size:
+                raise ValueError(f"文件大小校验失败: {path}")
+
+            expected_hash = str(meta.get("sha256") or "").lower()
+            if expected_hash and actual_hash != expected_hash:
+                raise ValueError(f"sha256 校验失败: {path}")
+
+            budget.add_file(path=path, size=size)
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     async def _download_bytes(self, client: httpx.AsyncClient, url: str, *, max_size: int) -> bytes:
-        response = await client.get(url)
-        response.raise_for_status()
-        content = response.content
-        if len(content) > max_size:
-            raise ValueError(f"文件超过大小上限: {url}")
-        return content
+        chunks: list[bytes] = []
+        total = 0
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            self._validate_content_length(response.headers.get("Content-Length"), max_size=max_size, label=url)
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_size:
+                    raise ValueError(f"文件超过大小上限: {url}")
+                chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def _download_file_to_temp(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        target: Path,
+        *,
+        max_size: int,
+    ) -> tuple[int, str, Path]:
+        """流式下载到临时文件；校验通过前绝不覆盖目标文件。"""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        total = 0
+        hasher = hashlib.sha256()
+        try:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                self._validate_content_length(response.headers.get("Content-Length"), max_size=max_size, label=url)
+                with tmp.open("wb") as file:
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_size:
+                            raise ValueError(f"文件超过大小上限: {url}")
+                        hasher.update(chunk)
+                        file.write(chunk)
+            return total, hasher.hexdigest(), tmp
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _activate_staging_dir(self, staging_dir: Path, resource_version: str) -> None:
-        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        previous_dir = CACHE_ROOT / "previous"
-        if previous_dir.exists():
-            shutil.rmtree(previous_dir)
-        if ACTIVE_RESOURCE_DIR.exists():
-            ACTIVE_RESOURCE_DIR.rename(previous_dir)
-        staging_dir.rename(ACTIVE_RESOURCE_DIR)
-        STATE_FILE.write_text(
-            json.dumps(
-                {
-                    "resource_version": resource_version,
-                    "synced_at": int(time.time()),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        self._activate_resource_dir(
+            staging_dir=staging_dir,
+            active_dir=ACTIVE_RESOURCE_DIR,
+            previous_dir=CACHE_ROOT / "previous",
+            state_file=STATE_FILE,
+            state_payload={"resource_version": resource_version, "synced_at": int(time.time())},
         )
 
     def _activate_private_staging_dir(self, staging_dir: Path, resource_version: str) -> None:
-        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        previous_dir = CACHE_ROOT / "private_previous"
-        if previous_dir.exists():
-            shutil.rmtree(previous_dir)
-        if PRIVATE_RESOURCE_DIR.exists():
-            PRIVATE_RESOURCE_DIR.rename(previous_dir)
-        staging_dir.rename(PRIVATE_RESOURCE_DIR)
-        PRIVATE_STATE_FILE.write_text(
-            json.dumps(
-                {
-                    "resource_version": resource_version,
-                    "synced_at": int(time.time()),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        self._activate_resource_dir(
+            staging_dir=staging_dir,
+            active_dir=PRIVATE_RESOURCE_DIR,
+            previous_dir=CACHE_ROOT / "private_previous",
+            state_file=PRIVATE_STATE_FILE,
+            state_payload={"resource_version": resource_version, "synced_at": int(time.time())},
         )
+
+    def _activate_resource_dir(
+        self,
+        *,
+        staging_dir: Path,
+        active_dir: Path,
+        previous_dir: Path,
+        state_file: Path,
+        state_payload: dict[str, Any],
+    ) -> None:
+        """事务式激活资源目录；任何一步失败都尽量恢复旧 active，避免资源目录被切空。"""
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        state_tmp = state_file.with_name(f".{state_file.name}.{uuid.uuid4().hex}.tmp")
+        moved_old = False
+        activated_new = False
+        old_active_backup = active_dir.exists()
+        old_previous_backup = previous_dir.exists()
+
+        previous_backup_dir = CACHE_ROOT / f".{previous_dir.name}_rollback_{uuid.uuid4().hex}"
+        if old_previous_backup:
+            previous_dir.rename(previous_backup_dir)
+
+        try:
+            if active_dir.exists():
+                active_dir.rename(previous_dir)
+                moved_old = True
+            staging_dir.rename(active_dir)
+            activated_new = True
+            state_tmp.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            state_tmp.replace(state_file)
+            if previous_backup_dir.exists():
+                shutil.rmtree(previous_backup_dir)
+        except Exception:
+            state_tmp.unlink(missing_ok=True)
+            if activated_new and active_dir.exists():
+                shutil.rmtree(active_dir, ignore_errors=True)
+            if moved_old and previous_dir.exists() and not active_dir.exists():
+                previous_dir.rename(active_dir)
+            if old_previous_backup and previous_backup_dir.exists() and not previous_dir.exists():
+                previous_backup_dir.rename(previous_dir)
+            raise
+        finally:
+            if previous_backup_dir.exists():
+                shutil.rmtree(previous_backup_dir, ignore_errors=True)
+
+        if not old_active_backup and previous_dir.exists():
+            # 没有旧 active 时，previous 不应凭空保留；这个分支只用于清理异常历史残留。
+            shutil.rmtree(previous_dir, ignore_errors=True)
+
+    def _new_staging_dir(self, prefix: str) -> Path:
+        """每次同步使用 UUID staging，避免同一秒内多任务撞目录。"""
+        return CACHE_ROOT / f".{prefix}_{uuid.uuid4().hex}"
+
+    def _validate_content_length(self, content_length: str | None, *, max_size: int, label: str) -> None:
+        if not content_length:
+            return
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            return
+        if declared_size > max_size:
+            raise ValueError(f"文件超过大小上限: {label}")
+
+    def _validate_manifest_path(self, path: str) -> None:
+        parsed = urlparse(path)
+        if parsed.scheme or parsed.netloc or path.startswith("/") or "\\" in path:
+            raise ValueError(f"manifest 文件路径非法: {path}")
+        parts = path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            raise ValueError(f"manifest 文件路径非法: {path}")
 
     # ================================ 校验与解析 ================================ #
     def _read_json_text(self, path: Path) -> str:

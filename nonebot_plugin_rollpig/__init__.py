@@ -25,6 +25,7 @@ from nonebot_plugin_htmlrender import template_to_pic
 from .config import Config
 from .catalog_renderer import render_catalog_image, shutdown_catalog_renderer
 from .perf_logging import log_perf
+from .render_budget import html_render_budget
 from .roast_manager import roast_manager
 from .resource_manager import pig_resource_manager
 from .runtime import (
@@ -608,16 +609,17 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
     pic = None
     try:
         render_started_at = time.perf_counter()
-        pic = await template_to_pic(
-            template_path=RES_DIR,
-            template_name="template.html",
-            templates={
-                "avatar": avatar_uri,
-                "name": name,
-                "desc": desc,
-                "analysis": analysis,
-            },
-        )
+        async with html_render_budget("pig-card"):
+            pic = await template_to_pic(
+                template_path=RES_DIR,
+                template_name="template.html",
+                templates={
+                    "avatar": avatar_uri,
+                    "name": name,
+                    "desc": desc,
+                    "analysis": analysis,
+                },
+            )
         render_finished_at = time.perf_counter()
     except Exception as e:
         logger.error(f"图片渲染失败: pig_id={pig_id}, error={e}")
@@ -643,11 +645,9 @@ async def send_rendered_pig(matcher, event, pig_data: dict, extra_text: str = ""
 
 async def sync_rollpig_resources(force: bool = False) -> str:
     """同步公有云端资源与可选私有 overlay；成功后立即刷新内存快照。"""
-    public_result = await pig_resource_manager.sync_from_remote(force=force)
-    private_result = await pig_resource_manager.sync_private_from_remote(force=force)
-
+    public_result, private_result = await pig_resource_manager.sync_all(force=force, wait_if_busy=force)
     if public_result.updated or private_result.updated:
-        reload_rollpig_resources()
+        PIG_LIST[:] = pig_resource_manager.pig_list
 
     messages = []
     for result in (public_result, private_result):

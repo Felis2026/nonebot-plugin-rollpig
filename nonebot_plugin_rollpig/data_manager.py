@@ -1,6 +1,7 @@
 import json
 import asyncio
 import datetime
+import shutil
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -57,6 +58,7 @@ def _next_charge_seconds(charges: int, updated_ts: float, now: float, cooldown: 
 # ================= 数据管理 =================
 
 DATA_FILE = store.get_plugin_data_file("pig_data.json")
+DATA_BACKUP_COUNT = 2
 
 
 class PigDataManager:
@@ -80,43 +82,52 @@ class PigDataManager:
     def __init__(self):
         self.file = DATA_FILE
         self._lock = asyncio.Lock()
+        self._load_failed = False
+        self._skip_backup_rotation_once = False
         self.data = self._load()
 
     # ---- 加载与迁移 ----
 
+    def _default_data(self) -> dict:
+        return {
+            "history": {},
+            "group_rolls": {},
+            "collection": {},
+            "pig_progress": {},
+            "draw_state": {},
+            "usage": {},
+            "force_usage": {},
+            "daily_events": {},
+            "protected": {},
+        }
+
     def _load(self) -> dict:
         if not self.file.exists():
-            default = {
-                "history": {},
-                "group_rolls": {},
-                "collection": {},
-                "pig_progress": {},
-                "draw_state": {},
-                "usage": {},
-                "force_usage": {},
-                "daily_events": {},
-                "protected": {},
-            }
+            default = self._default_data()
+            self.file.parent.mkdir(parents=True, exist_ok=True)
             self.file.write_text(json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8")
             return default
         try:
             raw = json.loads(self.file.read_text("utf-8"))
             return self._migrate(raw)
         except Exception as e:
-            logger.warning(f"pig_data.json 读取失败，已使用空数据兜底: {e}")
-            return {
-                "history": {},
-                "group_rolls": {},
-                "collection": {},
-                "pig_progress": {},
-                "draw_state": {},
-                "usage": {},
-                "force_usage": {},
-                "daily_events": {},
-                "protected": {},
-            }
+            self._load_failed = True
+            logger.error(f"pig_data.json 读取失败，进入写保护模式以避免覆盖旧数据: {e}")
+            self._preserve_broken_file()
 
-    def _migrate(self, data: dict) -> dict:
+            recovered = self._load_backup()
+            if recovered is not None:
+                logger.warning("pig_data.json 已从备份恢复，并写回主文件。")
+                self._load_failed = False
+                self.data = recovered
+                self._skip_backup_rotation_once = True
+                self._sync_save()
+                return recovered
+
+            logger.error("pig_data.json 没有可用备份；本地存储写操作将被拒绝，请手动修复数据文件。")
+            return self._default_data()
+
+    def _migrate(self, data: dict, *, persist: bool = True) -> dict:
         """将旧版 history（存完整 pig dict）迁移为新版（只存 pig_id 字符串）。
         迁移完成后立即同步落盘，防止进程在第一次写入前已退出导致磁盘仍为旧格式。
         """
@@ -205,23 +216,76 @@ class PigDataManager:
                 migrated = True
         if migrated:
             logger.info("pig_data.json 数据结构已自动迁移/补全，开始落盘...")
-            self.data = data
-            self._sync_save()  # 迁移后立即落盘，防止重启丢失
+            if persist:
+                self.data = data
+                self._sync_save()  # 迁移后立即落盘，防止重启丢失
         return data
 
     # ---- 原子写 ----
 
     def _sync_save(self):
         """同步原子写（仅用于启动期迁移，运行期写操作应使用 _atomic_save）。"""
+        self._ensure_writable()
         tmp = self.file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._rotate_backups()
         tmp.replace(self.file)
 
     async def _atomic_save(self):
         """异步原子写：写入临时文件再原子替换，防止写入中途崩溃导致 JSON 损坏。"""
+        self._ensure_writable()
         tmp = self.file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._rotate_backups()
         tmp.replace(self.file)  # 同一文件系统上是原子操作（Windows/Linux 均支持）
+
+    def _ensure_writable(self):
+        if self._load_failed:
+            raise RuntimeError("pig_data.json 读取失败，已拒绝写入以避免覆盖旧数据。请先修复数据文件或恢复备份。")
+
+    def _backup_paths(self) -> list[Path]:
+        return [self.file.with_name(f"{self.file.name}.bak{'' if index == 0 else f'.{index}'}") for index in range(DATA_BACKUP_COUNT + 1)]
+
+    def _rotate_backups(self) -> None:
+        """每次成功写入前保留滚动备份；从损坏文件恢复时跳过一次，避免把坏主文件覆盖好备份。"""
+        if self._skip_backup_rotation_once:
+            self._skip_backup_rotation_once = False
+            return
+        if not self.file.exists():
+            return
+
+        backup_paths = self._backup_paths()
+        for index in range(len(backup_paths) - 1, -1, -1):
+            source = self.file if index == 0 else backup_paths[index - 1]
+            target = backup_paths[index]
+            if not source.exists():
+                continue
+            if target.exists():
+                target.unlink()
+            shutil.copy2(source, target)
+
+    def _preserve_broken_file(self) -> None:
+        """把无法读取的主文件另存为 broken 备份，方便人工排查和恢复。"""
+        if not self.file.exists():
+            return
+        broken_path = self.file.with_name(f"{self.file.name}.broken.{int(time.time())}.bak")
+        try:
+            shutil.copy2(self.file, broken_path)
+            logger.error(f"pig_data.json 损坏文件已保留: {broken_path}")
+        except Exception as error:
+            logger.error(f"pig_data.json 损坏文件备份失败: {error}")
+
+    def _load_backup(self) -> Optional[dict]:
+        for backup_path in self._backup_paths():
+            if not backup_path.exists():
+                continue
+            try:
+                raw = json.loads(backup_path.read_text("utf-8"))
+                logger.warning(f"尝试从 pig_data.json 备份恢复: {backup_path}")
+                return self._migrate(raw, persist=False)
+            except Exception as error:
+                logger.warning(f"pig_data.json 备份不可用: {backup_path}: {error}")
+        return None
 
     # ---- 今日/历史 抽猪记录 ----
 

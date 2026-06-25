@@ -115,7 +115,8 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7
     "rollpig_catalog_cache_seconds": 300,      // 同一状态指纹的图鉴结果缓存秒数，不会额外刷新 copies
     "rollpig_catalog_output_format": "png",   // 输出格式；本分支默认 PNG
     "rollpig_catalog_render_timeout": 8.0,     // 单张图鉴渲染超时时间（秒）
-    "rollpig_catalog_scale_factor": 2.0        // 2x 渲染再输出，提升文字和徽章清晰度
+    "rollpig_catalog_scale_factor": 2.0,       // 2x 渲染再输出，提升文字和徽章清晰度
+    "rollpig_html_render_concurrency": 2       // 所有 HTML/Chromium 生图的总并发预算；高并发可覆盖到 4~6
   }
 }
 ```

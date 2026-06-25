@@ -5,7 +5,20 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from nonebot.log import logger
 from pydantic import BaseModel
+
+
+def _is_json_config_strict() -> bool:
+    """仅允许环境变量控制严格模式；配置文件本身坏掉时不能再依赖其中的开关。"""
+    return os.getenv("ROLLPIG_CONFIG_STRICT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _handle_json_config_error(path: Path, error: Exception) -> dict[str, Any]:
+    if _is_json_config_strict():
+        raise error
+    logger.error(f"rollpig JSON 配置读取失败，已忽略该文件: {path}: {error}")
+    return {}
 
 
 def _load_json_config_file() -> dict[str, Any]:
@@ -22,9 +35,12 @@ def _load_json_config_file() -> dict[str, Any]:
         path = raw_path.expanduser()
         if not path.exists():
             continue
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        if not isinstance(data, dict):
-            raise ValueError(f"rollpig JSON 配置必须是 object: {path}")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                raise ValueError(f"rollpig JSON 配置必须是 object: {path}")
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            return _handle_json_config_error(path, error)
         nested = data.get("rollpig")
         if isinstance(nested, dict):
             data = nested
@@ -75,6 +91,7 @@ class Config(BaseModel):
     rollpig_catalog_output_format: str = "png"
     rollpig_catalog_render_timeout: float = 8.0
     rollpig_catalog_scale_factor: float = 2.0
+    rollpig_html_render_concurrency: int = 2  # 普通卡片/图鉴共享的 Chromium 总并发预算
 
     # --- 代理设置 (可选，如果服务器在国内连不上API) ---
     rollpig_proxy: Optional[str] = None
