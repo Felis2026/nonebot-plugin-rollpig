@@ -21,7 +21,7 @@ pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@main
 或者使用 pip fixed-tag 安装：
 
 ```bash
-pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7.1"
+pip install -U "git+https://github.com/Felis2026/nonebot-plugin-rollpig.git@v0.7.2"
 
 ```
 
@@ -233,6 +233,19 @@ nonebot_plugin_rollpig/
 - 云端存储服务：[Felis2026/rollpig-cloud](https://github.com/Felis2026/rollpig-cloud)
 - PigHub（搜猪功能支持）：[pighub.top](https://pighub.top/)
 
+
+## v0.7.2 更新日志
+
+### 🛡️ 稳定性修复
+- 加固云端资源同步：改为流式下载、增加单文件大小上限，并通过临时目录激活，失败时继续保留旧缓存
+- 修复今日小猪与本地状态写入的并发竞态，降低本地 JSON 全量保存阻塞事件循环的风险
+- 新增 HTML 生图全局并发预算，避免图鉴与普通卡片渲染在高并发下同时挤爆 Chromium
+
+### ⚡ 性能与 AI 边界
+- 复用 rollpig-cloud HTTP 连接，减少云端存储模式下的重复建连开销，并在关闭时主动释放
+- 新增 AI 烤猪超时、并发、响应 token 与入库字符上限配置，异常或超时时自动回退本地模板
+
+---
 
 ## v0.7.1 更新日志
 
